@@ -4,6 +4,7 @@
 #include <MinHook/MinHook.h>
 
 #include <map>
+#include <mutex>
 #include <set>
 
 #include "../scs_logging.h"
@@ -14,6 +15,62 @@ using namespace scs_logging;
 
 typedef HRESULT(__stdcall* CreateTexture2D_t)(ID3D11Device*, const D3D11_TEXTURE2D_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
 static CreateTexture2D_t CreateTexture2D_Original = nullptr;
+
+typedef HRESULT(__stdcall* CreateShaderResourceView_t)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
+static CreateShaderResourceView_t CreateShaderResourceView_Original = nullptr;
+
+static std::mutex historical_live_textures_mutex;
+static std::set<ID3D11Resource*> historical_live_textures;
+
+HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pResource,
+    const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc, ID3D11ShaderResourceView** ppSRView)
+{
+    bool matches_live_texture = false;
+    {
+        std::lock_guard<std::mutex> lock(historical_live_textures_mutex);
+        matches_live_texture = historical_live_textures.count(pResource) != 0;
+    }
+
+    if (!matches_live_texture)
+        return CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
+
+    scs_log(0, "[SRV] resource matches liveTexture pResource=%p liveTexture=%p pDesc=%p",
+        pResource, pResource, pDesc);
+    if (!pDesc) {
+        scs_log(0, "[SRV] desc=null");
+        scs_log(0, "[SRV] default descriptor, resource format will be inherited");
+    }
+    else {
+        scs_log(0, "[SRV] desc Format=%u ViewDimension=%u", pDesc->Format, pDesc->ViewDimension);
+        switch (pDesc->ViewDimension) {
+        case D3D11_SRV_DIMENSION_TEXTURE2D:
+            scs_log(0, "[SRV] Texture2D MostDetailedMip=%u MipLevels=%u",
+                pDesc->Texture2D.MostDetailedMip, pDesc->Texture2D.MipLevels);
+            break;
+        case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+            scs_log(0, "[SRV] Texture2DArray MostDetailedMip=%u MipLevels=%u FirstArraySlice=%u ArraySize=%u",
+                pDesc->Texture2DArray.MostDetailedMip, pDesc->Texture2DArray.MipLevels,
+                pDesc->Texture2DArray.FirstArraySlice, pDesc->Texture2DArray.ArraySize);
+            break;
+        case D3D11_SRV_DIMENSION_TEXTURE2DMS:
+            scs_log(0, "[SRV] Texture2DMS descriptor");
+            break;
+        case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+            scs_log(0, "[SRV] Texture2DMSArray FirstArraySlice=%u ArraySize=%u",
+                pDesc->Texture2DMSArray.FirstArraySlice, pDesc->Texture2DMSArray.ArraySize);
+            break;
+        default:
+            break;
+        }
+        if (pDesc->Format == DXGI_FORMAT_BC3_UNORM_SRGB)
+            scs_log(2, "[SRV] WARNING: BC3_UNORM_SRGB SRV requested for RGBA8_UNORM resource");
+    }
+
+    HRESULT hr = CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
+    scs_log(SUCCEEDED(hr) ? 0 : 2, "[SRV] CreateShaderResourceView HRESULT=0x%08X returned SRV=%p",
+        hr, ppSRView ? *ppSRView : nullptr);
+    return hr;
+}
 
 HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC* pDesc, const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
 {
@@ -100,6 +157,10 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 screen.liveTextureHeight = modifiedDesc.Height;
 
                 screen.liveTexture = *ppTexture2D;
+                {
+                    std::lock_guard<std::mutex> lock(historical_live_textures_mutex);
+                    historical_live_textures.insert(static_cast<ID3D11Resource*>(screen.liveTexture));
+                }
                 screen.liveTexture->AddRef(); // own a ref independent of the games
                 pDevice->GetImmediateContext(&screen.immediateContext);
 
@@ -121,12 +182,12 @@ void new_frame()
 {
     static std::set<std::string> frame_state_logged;
     static std::set<std::string> frame_missing_logged;
-    static std::set<std::string> post_live_texture_logged;
+    static std::set<ID3D11Texture2D*> post_live_texture_logged;
     static std::map<std::string, ID3D11Texture2D*> previous_live_texture;
-    static std::map<std::string, bool> copy_result_logged;
-    static std::map<std::string, bool> map_result_logged;
-    static std::set<std::string> upload_started_logged;
-    static std::set<std::string> upload_completed_logged;
+    static std::map<ID3D11Texture2D*, bool> copy_result_logged;
+    static std::map<ID3D11Texture2D*, bool> map_result_logged;
+    static std::set<ID3D11Texture2D*> upload_started_logged;
+    static std::set<ID3D11Texture2D*> upload_completed_logged;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -145,7 +206,7 @@ void new_frame()
             scs_log(0, "[FRAME] liveTexture changed old=%p new=%p",
                 static_cast<void*>(previous_texture), static_cast<void*>(screen.liveTexture));
             previous_texture = screen.liveTexture;
-            if (screen.liveTexture && post_live_texture_logged.insert(screen.original_texture).second) {
+            if (screen.liveTexture && post_live_texture_logged.insert(screen.liveTexture).second) {
                 scs_log(0, "[FRAME] post-liveTexture source=%p liveTexture=%p immediateContext=%p liveTextureWidth=%u liveTextureHeight=%u",
                     static_cast<void*>(screen.source.get()), static_cast<void*>(screen.liveTexture),
                     static_cast<void*>(screen.immediateContext), screen.liveTextureWidth, screen.liveTextureHeight);
@@ -162,9 +223,9 @@ void new_frame()
         const UINT srcWidth = screen.source->GetWidth();
         const UINT srcHeight = screen.source->GetHeight();
         const bool buffer_present = !screen.frameScratch.empty() && screen.frameScratch.data() != nullptr;
-        auto copy_state = copy_result_logged.find(screen.original_texture);
+        auto copy_state = copy_result_logged.find(screen.liveTexture);
         if (copy_state == copy_result_logged.end() || copy_state->second != copy_succeeded) {
-            copy_result_logged[screen.original_texture] = copy_succeeded;
+            copy_result_logged[screen.liveTexture] = copy_succeeded;
             scs_log(copy_succeeded ? 0 : 2, "[FRAME] CopyLatestFrame %s width=%u height=%u stride=unavailable buffer=%p bufferBytes=%zu",
                 copy_succeeded ? "success" : "failed", srcWidth, srcHeight,
                 buffer_present ? screen.frameScratch.data() : nullptr, screen.frameScratch.size());
@@ -180,16 +241,16 @@ void new_frame()
         D3D11_MAPPED_SUBRESOURCE mapped{};
         HRESULT map_hr = screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         const bool map_succeeded = SUCCEEDED(map_hr);
-        auto map_state = map_result_logged.find(screen.original_texture);
+        auto map_state = map_result_logged.find(screen.liveTexture);
         if (map_state == map_result_logged.end() || map_state->second != map_succeeded) {
-            map_result_logged[screen.original_texture] = map_succeeded;
+            map_result_logged[screen.liveTexture] = map_succeeded;
             scs_log(map_succeeded ? 0 : 2, "[FRAME] Map HRESULT=0x%08X MappedResource.pData=%p RowPitch=%u",
                 map_hr, mapped.pData, mapped.RowPitch);
         }
         if (!map_succeeded)
             continue;
 
-        if (upload_started_logged.insert(screen.original_texture).second)
+        if (upload_started_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] copying frame to liveTexture");
 
         const uint8_t* src = screen.frameScratch.data();
@@ -213,7 +274,7 @@ void new_frame()
         }
 
         screen.immediateContext->Unmap(screen.liveTexture, 0);
-        if (upload_completed_logged.insert(screen.original_texture).second)
+        if (upload_completed_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] frame upload completed");
     }
 }
@@ -241,6 +302,17 @@ namespace dx11::create_texture_2d {
 
         MH_CreateHook(createTexture2DAddr, &HookedCreateTexture2D, reinterpret_cast<LPVOID*>(&CreateTexture2D_Original));
         MH_EnableHook(createTexture2DAddr);
+
+        void* createShaderResourceViewAddr = deviceVtbl[7];
+        MH_STATUS srv_create_status = MH_CreateHook(createShaderResourceViewAddr, &HookedCreateShaderResourceView,
+            reinterpret_cast<LPVOID*>(&CreateShaderResourceView_Original));
+        scs_log(0, "[SRV] hook address=%p MH_CreateHook status=%s original=%p",
+            createShaderResourceViewAddr, MH_StatusToString(srv_create_status),
+            reinterpret_cast<void*>(CreateShaderResourceView_Original));
+        if (srv_create_status == MH_OK) {
+            MH_STATUS srv_enable_status = MH_EnableHook(createShaderResourceViewAddr);
+            scs_log(0, "[SRV] MH_EnableHook status=%s", MH_StatusToString(srv_enable_status));
+        }
 
         pDummyContext->Release();
         pDummyDevice->Release();
