@@ -110,6 +110,94 @@ void HookedPSSetShader(ID3D11DeviceContext* pContext, ID3D11PixelShader* pPixelS
     PSSetShader_Original(pContext, pPixelShader, ppClassInstances, NumClassInstances);
 }
 
+static std::atomic<uint32_t> pre_draw_pattern_injection_count{};
+
+void InjectPreDrawTestPattern(ID3D11DeviceContext* pContext)
+{
+    ID3D11Resource* tracked_resource = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+        for (const auto& [slot_key, state] : tracked_bound_slots) {
+            if (slot_key.first != pContext)
+                continue;
+
+            auto tracked = tracked_live_srvs.find(state.srv);
+            if (tracked != tracked_live_srvs.end()) {
+                tracked_resource = tracked->second;
+                break;
+            }
+        }
+    }
+
+    if (!tracked_resource)
+        return;
+
+    ID3D11Texture2D* live_texture = nullptr;
+    ID3D11DeviceContext* immediate_context = nullptr;
+    UINT width = 0;
+    UINT height = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_screens_mutex);
+        for (auto& screen : g_screens) {
+            if (screen.type == screen_type_t::GPS &&
+                static_cast<ID3D11Resource*>(screen.liveTexture) == tracked_resource) {
+                live_texture = screen.liveTexture;
+                immediate_context = screen.immediateContext;
+                width = screen.liveTextureWidth;
+                height = screen.liveTextureHeight;
+                break;
+            }
+        }
+    }
+
+    if (!live_texture || !immediate_context || width == 0 || height == 0)
+        return;
+
+    const uint32_t injection = pre_draw_pattern_injection_count.fetch_add(1);
+    if (injection >= 10)
+        return;
+
+    scs_log(0, "[TESTPREDRAW] injecting test pattern before DrawIndexed");
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT map_hr = immediate_context->Map(live_texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    scs_log(SUCCEEDED(map_hr) ? 0 : 2, "[TESTPREDRAW] Map HRESULT=0x%08X", map_hr);
+    if (FAILED(map_hr))
+        return;
+
+    const UINT min_dimension = width < height ? width : height;
+    const UINT cross_thickness = (min_dimension / 100) > 4 ? (min_dimension / 100) : 4;
+    const UINT center_x = width / 2;
+    const UINT center_y = height / 2;
+    auto* dst_base = static_cast<uint8_t*>(mapped.pData);
+    for (UINT y = 0; y < height; ++y) {
+        uint8_t* row = dst_base + static_cast<size_t>(y) * mapped.RowPitch;
+        for (UINT x = 0; x < width; ++x) {
+            const bool vertical_cross = x >= center_x - cross_thickness / 2 &&
+                x < center_x + (cross_thickness + 1) / 2;
+            const bool horizontal_cross = y >= center_y - cross_thickness / 2 &&
+                y < center_y + (cross_thickness + 1) / 2;
+            uint8_t* pixel = row + static_cast<size_t>(x) * 4;
+            if (vertical_cross || horizontal_cross) {
+                pixel[0] = 0; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255;
+            }
+            else if (y < center_y && x < center_x) {
+                pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255;
+            }
+            else if (y < center_y) {
+                pixel[0] = 0; pixel[1] = 255; pixel[2] = 0; pixel[3] = 255;
+            }
+            else if (x < center_x) {
+                pixel[0] = 0; pixel[1] = 0; pixel[2] = 255; pixel[3] = 255;
+            }
+            else {
+                pixel[0] = 255; pixel[1] = 255; pixel[2] = 255; pixel[3] = 255;
+            }
+        }
+    }
+    immediate_context->Unmap(live_texture, 0);
+    scs_log(0, "[TESTPREDRAW] pattern upload completed");
+}
+
 void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
     UINT start, INT base)
 {
@@ -139,6 +227,7 @@ void HookedDraw(ID3D11DeviceContext* pContext, UINT VertexCount, UINT StartVerte
 void HookedDrawIndexed(ID3D11DeviceContext* pContext, UINT IndexCount,
     UINT StartIndexLocation, INT BaseVertexLocation)
 {
+    InjectPreDrawTestPattern(pContext);
     LogTrackedDraw(pContext, "DrawIndexed", IndexCount, StartIndexLocation, BaseVertexLocation);
     DrawIndexed_Original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
