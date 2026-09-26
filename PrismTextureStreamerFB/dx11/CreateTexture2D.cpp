@@ -3,6 +3,7 @@
 
 #include <MinHook/MinHook.h>
 
+#include <map>
 #include <set>
 
 #include "../scs_logging.h"
@@ -88,7 +89,11 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 modifiedDesc.Format, modifiedDesc.MipLevels, hr, (ppTexture2D ? *ppTexture2D : nullptr));
             if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D)
             {
-                if (screen.liveTexture) screen.liveTexture->Release();
+                if (screen.liveTexture) {
+                    scs_log(0, "[FRAME] liveTexture changed old=%p new=null (releasing before replacement)",
+                        static_cast<void*>(screen.liveTexture));
+                    screen.liveTexture->Release();
+                }
                 if (screen.immediateContext) screen.immediateContext->Release();
 
                 screen.liveTextureWidth = modifiedDesc.Width;
@@ -116,6 +121,12 @@ void new_frame()
 {
     static std::set<std::string> frame_state_logged;
     static std::set<std::string> frame_missing_logged;
+    static std::set<std::string> post_live_texture_logged;
+    static std::map<std::string, ID3D11Texture2D*> previous_live_texture;
+    static std::map<std::string, bool> copy_result_logged;
+    static std::map<std::string, bool> map_result_logged;
+    static std::set<std::string> upload_started_logged;
+    static std::set<std::string> upload_completed_logged;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -128,26 +139,58 @@ void new_frame()
                 screen.liveTexture ? "assigned" : "null",
                 screen.immediateContext ? "assigned" : "null");
         }
+
+        ID3D11Texture2D*& previous_texture = previous_live_texture[screen.original_texture];
+        if (previous_texture != screen.liveTexture) {
+            scs_log(0, "[FRAME] liveTexture changed old=%p new=%p",
+                static_cast<void*>(previous_texture), static_cast<void*>(screen.liveTexture));
+            previous_texture = screen.liveTexture;
+            if (screen.liveTexture && post_live_texture_logged.insert(screen.original_texture).second) {
+                scs_log(0, "[FRAME] post-liveTexture source=%p liveTexture=%p immediateContext=%p liveTextureWidth=%u liveTextureHeight=%u",
+                    static_cast<void*>(screen.source.get()), static_cast<void*>(screen.liveTexture),
+                    static_cast<void*>(screen.immediateContext), screen.liveTextureWidth, screen.liveTextureHeight);
+            }
+        }
+
         if (!screen.liveTexture && frame_missing_logged.insert(screen.original_texture).second)
             scs_log(2, "[FRAME] capture source ready but liveTexture was never created");
 
         if (!screen.liveTexture || !screen.immediateContext)
             continue;
 
-        if (!screen.source->CopyLatestFrame(screen.frameScratch))
-            continue;
-
+        const bool copy_succeeded = screen.source->CopyLatestFrame(screen.frameScratch);
         const UINT srcWidth = screen.source->GetWidth();
         const UINT srcHeight = screen.source->GetHeight();
+        const bool buffer_present = !screen.frameScratch.empty() && screen.frameScratch.data() != nullptr;
+        auto copy_state = copy_result_logged.find(screen.original_texture);
+        if (copy_state == copy_result_logged.end() || copy_state->second != copy_succeeded) {
+            copy_result_logged[screen.original_texture] = copy_succeeded;
+            scs_log(copy_succeeded ? 0 : 2, "[FRAME] CopyLatestFrame %s width=%u height=%u stride=unavailable buffer=%p bufferBytes=%zu",
+                copy_succeeded ? "success" : "failed", srcWidth, srcHeight,
+                buffer_present ? screen.frameScratch.data() : nullptr, screen.frameScratch.size());
+        }
+        if (!copy_succeeded)
+            continue;
+
         const UINT dstWidth = screen.liveTextureWidth;
         const UINT dstHeight = screen.liveTextureHeight;
         if (srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
             continue;
 
-
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        if (FAILED(screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        HRESULT map_hr = screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        const bool map_succeeded = SUCCEEDED(map_hr);
+        auto map_state = map_result_logged.find(screen.original_texture);
+        if (map_state == map_result_logged.end() || map_state->second != map_succeeded) {
+            map_result_logged[screen.original_texture] = map_succeeded;
+            scs_log(map_succeeded ? 0 : 2, "[FRAME] Map HRESULT=0x%08X MappedResource.pData=%p RowPitch=%u",
+                map_hr, mapped.pData, mapped.RowPitch);
+        }
+        if (!map_succeeded)
             continue;
+
+        if (upload_started_logged.insert(screen.original_texture).second)
+            scs_log(0, "[FRAME] copying frame to liveTexture");
 
         const uint8_t* src = screen.frameScratch.data();
         uint8_t* dstBase = static_cast<uint8_t*>(mapped.pData);
@@ -170,6 +213,8 @@ void new_frame()
         }
 
         screen.immediateContext->Unmap(screen.liveTexture, 0);
+        if (upload_completed_logged.insert(screen.original_texture).second)
+            scs_log(0, "[FRAME] frame upload completed");
     }
 }
 
