@@ -3,6 +3,8 @@
 
 #include <MinHook/MinHook.h>
 
+#include <set>
+
 #include "../scs_logging.h"
 using namespace scs_logging;
 
@@ -22,15 +24,45 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             if (!screen.source.get()) continue; // no source, cant use this
 
             if (!pDesc) continue;
-            if (pDesc->Width != screen.override_texture_size_w) continue;
-            if (pDesc->Height != screen.override_texture_size_h) continue;
-            if (pDesc->Format != DXGI_FORMAT_BC3_UNORM) continue;
-            if (pDesc->Usage != D3D11_USAGE_DEFAULT) continue;
-            if (pDesc->BindFlags != D3D11_BIND_SHADER_RESOURCE) continue;
-            if (pInitialData) continue;
-            if (pDesc->MipLevels != 1) continue; // Dynamic textures require exactly 1 mip
+            if (pDesc->Width != 64 && pDesc->Height != 64 &&
+                pDesc->Width != 2048 && pDesc->Height != 2048)
+                continue;
 
+            scs_log(0, "[C2D] candidate %ux%u Format=%u Usage=%u BindFlags=0x%X CPUAccessFlags=0x%X MiscFlags=0x%X MipLevels=%u ArraySize=%u InitialData=%s",
+                pDesc->Width, pDesc->Height, pDesc->Format, pDesc->Usage, pDesc->BindFlags,
+                pDesc->CPUAccessFlags, pDesc->MiscFlags, pDesc->MipLevels, pDesc->ArraySize,
+                pInitialData ? "not null" : "null");
 
+            if (pDesc->Width != screen.override_texture_size_w) {
+                scs_log(0, "[C2D] reject: Width expected %u", screen.override_texture_size_w);
+                continue;
+            }
+            if (pDesc->Height != screen.override_texture_size_h) {
+                scs_log(0, "[C2D] reject: Height expected %u", screen.override_texture_size_h);
+                continue;
+            }
+            if (pDesc->Format != DXGI_FORMAT_BC3_UNORM) {
+                scs_log(0, "[C2D] reject: Format expected %u", DXGI_FORMAT_BC3_UNORM);
+                continue;
+            }
+            if (pDesc->Usage != D3D11_USAGE_DEFAULT) {
+                scs_log(0, "[C2D] reject: Usage expected %u", D3D11_USAGE_DEFAULT);
+                continue;
+            }
+            if (pDesc->BindFlags != D3D11_BIND_SHADER_RESOURCE) {
+                scs_log(0, "[C2D] reject: BindFlags expected 0x%X", D3D11_BIND_SHADER_RESOURCE);
+                continue;
+            }
+            if (pInitialData) {
+                scs_log(0, "[C2D] reject: InitialData not null");
+                continue;
+            }
+            if (pDesc->MipLevels != 1) {
+                scs_log(0, "[C2D] reject: MipLevels expected 1");
+                continue;
+            }
+
+            scs_log(0, "[C2D] fingerprint matched");
             D3D11_TEXTURE2D_DESC modifiedDesc = *pDesc;
             modifiedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             modifiedDesc.Usage = D3D11_USAGE_DYNAMIC;
@@ -40,6 +72,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             modifiedDesc.Height = screen.targetLiveTextureHeight;
 
             HRESULT hr = CreateTexture2D_Original(pDevice, &modifiedDesc, pInitialData, ppTexture2D);
+            scs_log(0, "[C2D] original CreateTexture2D HRESULT=0x%08X returned texture ptr=%p",
+                hr, (ppTexture2D ? *ppTexture2D : nullptr));
             if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D)
             {
                 if (screen.liveTexture) screen.liveTexture->Release();
@@ -52,7 +86,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 screen.liveTexture->AddRef(); // own a ref independent of the games
                 pDevice->GetImmediateContext(&screen.immediateContext);
 
-                scs_log(0, "[dx11::create_texture_2d] matched texture '%s'", screen.original_texture.c_str());
+                scs_log(0, "[C2D] liveTexture assigned ptr=%p immediateContext assigned ptr=%p",
+                    screen.liveTexture, screen.immediateContext);
             }
             else {
                 scs_log(2, "[dx11::create_texture_2d] rewrite of %s FAILED, hr=0x%08X", screen.original_texture.c_str(), hr);
@@ -67,11 +102,22 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
 
 void new_frame()
 {
+    static std::set<std::string> frame_state_logged;
+    static std::set<std::string> frame_missing_logged;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
         if (!screen.source.get())
             continue;
+
+        if (frame_state_logged.insert(screen.original_texture).second) {
+            scs_log(0, "[FRAME] source=%s liveTexture=%s immediateContext=%s",
+                screen.source.get() ? "ready" : "null",
+                screen.liveTexture ? "assigned" : "null",
+                screen.immediateContext ? "assigned" : "null");
+        }
+        if (!screen.liveTexture && frame_missing_logged.insert(screen.original_texture).second)
+            scs_log(2, "[FRAME] capture source ready but liveTexture was never created");
 
         if (!screen.liveTexture || !screen.immediateContext)
             continue;
