@@ -1,7 +1,6 @@
 #include "dx11.h"
 #include <d3d11.h>
 
-#include <algorithm>
 #include <atomic>
 #include <MinHook/MinHook.h>
 
@@ -391,8 +390,9 @@ void new_frame()
 
         uint8_t* dstBase = static_cast<uint8_t*>(mapped.pData);
         if (use_test_pattern) {
-            const UINT cross_thickness = (std::min(dstWidth, dstHeight) / 100) > 4
-                ? (std::min(dstWidth, dstHeight) / 100) : 4;
+            const UINT min_dimension = dstWidth < dstHeight ? dstWidth : dstHeight;
+            const UINT cross_thickness = (min_dimension / 100) > 4
+                ? (min_dimension / 100) : 4;
             const UINT center_x = dstWidth / 2;
             const UINT center_y = dstHeight / 2;
             for (UINT y = 0; y < dstHeight; ++y) {
