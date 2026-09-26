@@ -1,6 +1,7 @@
 #include "dx11.h"
 #include <d3d11.h>
 
+#include <algorithm>
 #include <atomic>
 #include <MinHook/MinHook.h>
 
@@ -316,6 +317,7 @@ void new_frame()
     static std::map<ID3D11Texture2D*, bool> map_result_logged;
     static std::set<ID3D11Texture2D*> upload_started_logged;
     static std::set<ID3D11Texture2D*> upload_completed_logged;
+    static bool test_pattern_logged{};
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -358,12 +360,13 @@ void new_frame()
                 copy_succeeded ? "success" : "failed", srcWidth, srcHeight,
                 buffer_present ? screen.frameScratch.data() : nullptr, screen.frameScratch.size());
         }
-        if (!copy_succeeded)
+        const bool use_test_pattern = screen.type == screen_type_t::GPS;
+        if (!copy_succeeded && !use_test_pattern)
             continue;
 
         const UINT dstWidth = screen.liveTextureWidth;
         const UINT dstHeight = screen.liveTextureHeight;
-        if (srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
+        if ((!use_test_pattern && (srcWidth == 0 || srcHeight == 0)) || dstWidth == 0 || dstHeight == 0)
             continue;
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -381,23 +384,60 @@ void new_frame()
         if (upload_started_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] copying frame to liveTexture");
 
-        const uint8_t* src = screen.frameScratch.data();
+        if (use_test_pattern && !test_pattern_logged) {
+            test_pattern_logged = true;
+            scs_log(0, "[TESTPATTERN] liveTexture test pattern enabled");
+        }
+
         uint8_t* dstBase = static_cast<uint8_t*>(mapped.pData);
-
-        for (UINT y = 0; y < dstHeight; ++y)
-        {
-            const UINT srcY = static_cast<UINT>(static_cast<uint64_t>(y) * srcHeight / dstHeight);
-            const UINT dstRow = screen.flipVertical ? (dstHeight - 1 - y) : y;
-            const uint8_t* srcRow = src + static_cast<size_t>(srcY) * srcWidth * 4;
-            uint8_t* dstRowPtr = dstBase + static_cast<size_t>(dstRow) * mapped.RowPitch;
-
-            if (srcWidth == dstWidth) {
-                memcpy(dstRowPtr, srcRow, static_cast<size_t>(dstWidth) * 4);
-                continue;
+        if (use_test_pattern) {
+            const UINT cross_thickness = (std::min(dstWidth, dstHeight) / 100) > 4
+                ? (std::min(dstWidth, dstHeight) / 100) : 4;
+            const UINT center_x = dstWidth / 2;
+            const UINT center_y = dstHeight / 2;
+            for (UINT y = 0; y < dstHeight; ++y) {
+                uint8_t* dstRowPtr = dstBase + static_cast<size_t>(y) * mapped.RowPitch;
+                for (UINT x = 0; x < dstWidth; ++x) {
+                    const bool vertical_cross = x >= center_x - cross_thickness / 2 &&
+                        x < center_x + (cross_thickness + 1) / 2;
+                    const bool horizontal_cross = y >= center_y - cross_thickness / 2 &&
+                        y < center_y + (cross_thickness + 1) / 2;
+                    uint8_t* pixel = dstRowPtr + static_cast<size_t>(x) * 4;
+                    if (vertical_cross || horizontal_cross) {
+                        pixel[0] = 0; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255;
+                    }
+                    else if (y < center_y && x < center_x) {
+                        pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; pixel[3] = 255;
+                    }
+                    else if (y < center_y) {
+                        pixel[0] = 0; pixel[1] = 255; pixel[2] = 0; pixel[3] = 255;
+                    }
+                    else if (x < center_x) {
+                        pixel[0] = 0; pixel[1] = 0; pixel[2] = 255; pixel[3] = 255;
+                    }
+                    else {
+                        pixel[0] = 255; pixel[1] = 255; pixel[2] = 255; pixel[3] = 255;
+                    }
+                }
             }
-            for (UINT x = 0; x < dstWidth; ++x) {
-                const UINT srcX = static_cast<UINT>(static_cast<uint64_t>(x) * srcWidth / dstWidth);
-                memcpy(dstRowPtr + static_cast<size_t>(x) * 4, srcRow + static_cast<size_t>(srcX) * 4, 4);
+        }
+        else {
+            const uint8_t* src = screen.frameScratch.data();
+            for (UINT y = 0; y < dstHeight; ++y)
+            {
+                const UINT srcY = static_cast<UINT>(static_cast<uint64_t>(y) * srcHeight / dstHeight);
+                const UINT dstRow = screen.flipVertical ? (dstHeight - 1 - y) : y;
+                const uint8_t* srcRow = src + static_cast<size_t>(srcY) * srcWidth * 4;
+                uint8_t* dstRowPtr = dstBase + static_cast<size_t>(dstRow) * mapped.RowPitch;
+
+                if (srcWidth == dstWidth) {
+                    memcpy(dstRowPtr, srcRow, static_cast<size_t>(dstWidth) * 4);
+                    continue;
+                }
+                for (UINT x = 0; x < dstWidth; ++x) {
+                    const UINT srcX = static_cast<UINT>(static_cast<uint64_t>(x) * srcWidth / dstWidth);
+                    memcpy(dstRowPtr + static_cast<size_t>(x) * 4, srcRow + static_cast<size_t>(srcX) * 4, 4);
+                }
             }
         }
 
