@@ -21,6 +21,43 @@ static CreateShaderResourceView_t CreateShaderResourceView_Original = nullptr;
 
 static std::mutex historical_live_textures_mutex;
 static std::set<ID3D11Resource*> historical_live_textures;
+static std::mutex tracked_live_srvs_mutex;
+static std::map<ID3D11ShaderResourceView*, ID3D11Resource*> tracked_live_srvs;
+static std::map<std::pair<ID3D11DeviceContext*, UINT>, ID3D11ShaderResourceView*> tracked_bound_slots;
+
+typedef void(__stdcall* PSSetShaderResources_t)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
+static PSSetShaderResources_t PSSetShaderResources_Original = nullptr;
+
+void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, UINT NumViews,
+    ID3D11ShaderResourceView* const* ppShaderResourceViews)
+{
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+    for (UINT index = 0; index < NumViews; ++index) {
+        const UINT slot = StartSlot + index;
+        ID3D11ShaderResourceView* new_srv = ppShaderResourceViews ? ppShaderResourceViews[index] : nullptr;
+        auto slot_key = std::make_pair(pContext, slot);
+        auto previous = tracked_bound_slots.find(slot_key);
+        ID3D11ShaderResourceView* old_srv = previous == tracked_bound_slots.end() ? nullptr : previous->second;
+        const bool new_is_tracked = tracked_live_srvs.count(new_srv) != 0;
+        const bool old_was_tracked = old_srv != nullptr;
+
+        if (new_is_tracked) {
+            ID3D11Resource* resource = tracked_live_srvs[new_srv];
+            if (old_srv != new_srv) {
+                scs_log(0, "[PS] tracked live SRV bound context=%p StartSlot=%u NumViews=%u index=%u slot=%u srv=%p resource=%p",
+                    pContext, StartSlot, NumViews, index, slot, new_srv, resource);
+            }
+            tracked_bound_slots[slot_key] = new_srv;
+        }
+        else if (old_was_tracked) {
+            scs_log(0, "[PS] tracked live SRV slot replaced slot=%u old=%p new=%p",
+                slot, old_srv, new_srv);
+            tracked_bound_slots.erase(slot_key);
+        }
+    }
+
+    PSSetShaderResources_Original(pContext, StartSlot, NumViews, ppShaderResourceViews);
+}
 
 HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pResource,
     const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc, ID3D11ShaderResourceView** ppSRView)
@@ -69,6 +106,11 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     HRESULT hr = CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
     scs_log(SUCCEEDED(hr) ? 0 : 2, "[SRV] CreateShaderResourceView HRESULT=0x%08X returned SRV=%p",
         hr, ppSRView ? *ppSRView : nullptr);
+    if (SUCCEEDED(hr) && ppSRView && *ppSRView) {
+        std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+        tracked_live_srvs[*ppSRView] = pResource;
+        scs_log(0, "[SRV] tracked live SRV resource=%p srv=%p", pResource, *ppSRView);
+    }
     return hr;
 }
 
@@ -312,6 +354,18 @@ namespace dx11::create_texture_2d {
         if (srv_create_status == MH_OK) {
             MH_STATUS srv_enable_status = MH_EnableHook(createShaderResourceViewAddr);
             scs_log(0, "[SRV] MH_EnableHook status=%s", MH_StatusToString(srv_enable_status));
+        }
+
+        void** contextVtbl = *reinterpret_cast<void***>(pDummyContext);
+        void* psSetShaderResourcesAddr = contextVtbl[8];
+        MH_STATUS ps_create_status = MH_CreateHook(psSetShaderResourcesAddr, &HookedPSSetShaderResources,
+            reinterpret_cast<LPVOID*>(&PSSetShaderResources_Original));
+        scs_log(0, "[PS] hook address=%p MH_CreateHook status=%s original=%p",
+            psSetShaderResourcesAddr, MH_StatusToString(ps_create_status),
+            reinterpret_cast<void*>(PSSetShaderResources_Original));
+        if (ps_create_status == MH_OK) {
+            MH_STATUS ps_enable_status = MH_EnableHook(psSetShaderResourcesAddr);
+            scs_log(0, "[PS] MH_EnableHook status=%s", MH_StatusToString(ps_enable_status));
         }
 
         pDummyContext->Release();
