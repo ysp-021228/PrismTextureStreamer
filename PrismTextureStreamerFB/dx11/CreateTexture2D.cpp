@@ -23,10 +23,23 @@ static std::mutex historical_live_textures_mutex;
 static std::set<ID3D11Resource*> historical_live_textures;
 static std::mutex tracked_live_srvs_mutex;
 static std::map<ID3D11ShaderResourceView*, ID3D11Resource*> tracked_live_srvs;
-static std::map<std::pair<ID3D11DeviceContext*, UINT>, ID3D11ShaderResourceView*> tracked_bound_slots;
+struct tracked_slot_state_t {
+    ID3D11ShaderResourceView* srv{};
+    uint64_t generation{};
+    bool draw_seen{};
+};
+static std::map<std::pair<ID3D11DeviceContext*, UINT>, tracked_slot_state_t> tracked_bound_slots;
+static std::map<ID3D11DeviceContext*, ID3D11PixelShader*> current_pixel_shaders;
+static uint64_t next_bind_generation{};
 
 typedef void(__stdcall* PSSetShaderResources_t)(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 static PSSetShaderResources_t PSSetShaderResources_Original = nullptr;
+typedef void(__stdcall* PSSetShader_t)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
+static PSSetShader_t PSSetShader_Original = nullptr;
+typedef void(__stdcall* Draw_t)(ID3D11DeviceContext*, UINT, UINT);
+static Draw_t Draw_Original = nullptr;
+typedef void(__stdcall* DrawIndexed_t)(ID3D11DeviceContext*, UINT, UINT, INT);
+static DrawIndexed_t DrawIndexed_Original = nullptr;
 
 void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, UINT NumViews,
     ID3D11ShaderResourceView* const* ppShaderResourceViews)
@@ -37,26 +50,70 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
         ID3D11ShaderResourceView* new_srv = ppShaderResourceViews ? ppShaderResourceViews[index] : nullptr;
         auto slot_key = std::make_pair(pContext, slot);
         auto previous = tracked_bound_slots.find(slot_key);
-        ID3D11ShaderResourceView* old_srv = previous == tracked_bound_slots.end() ? nullptr : previous->second;
         const bool new_is_tracked = tracked_live_srvs.count(new_srv) != 0;
-        const bool old_was_tracked = old_srv != nullptr;
+        const bool old_was_tracked = previous != tracked_bound_slots.end();
 
         if (new_is_tracked) {
             ID3D11Resource* resource = tracked_live_srvs[new_srv];
-            if (old_srv != new_srv) {
-                scs_log(0, "[PS] tracked live SRV bound context=%p StartSlot=%u NumViews=%u index=%u slot=%u srv=%p resource=%p",
-                    pContext, StartSlot, NumViews, index, slot, new_srv, resource);
+            if (!old_was_tracked || previous->second.srv != new_srv) {
+                tracked_slot_state_t state;
+                state.srv = new_srv;
+                state.generation = ++next_bind_generation;
+                tracked_bound_slots[slot_key] = state;
+                scs_log(0, "[PS] tracked live SRV bound generation=%llu context=%p StartSlot=%u NumViews=%u index=%u slot=%u srv=%p resource=%p",
+                    state.generation, pContext, StartSlot, NumViews, index, slot, new_srv, resource);
             }
-            tracked_bound_slots[slot_key] = new_srv;
         }
         else if (old_was_tracked) {
-            scs_log(0, "[PS] tracked live SRV slot replaced slot=%u old=%p new=%p",
-                slot, old_srv, new_srv);
+            const tracked_slot_state_t state = previous->second;
+            scs_log(0, "[PS] tracked live SRV slot replaced generation=%llu slot=%u old=%p new=%p drawSeen=%s",
+                state.generation, slot, state.srv, new_srv, state.draw_seen ? "true" : "false");
             tracked_bound_slots.erase(slot_key);
         }
     }
 
     PSSetShaderResources_Original(pContext, StartSlot, NumViews, ppShaderResourceViews);
+}
+
+void HookedPSSetShader(ID3D11DeviceContext* pContext, ID3D11PixelShader* pPixelShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
+{
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+    current_pixel_shaders[pContext] = pPixelShader;
+    PSSetShader_Original(pContext, pPixelShader, ppClassInstances, NumClassInstances);
+}
+
+void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
+    UINT start, INT base)
+{
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+    for (auto& [slot_key, state] : tracked_bound_slots) {
+        if (slot_key.first != pContext || state.draw_seen)
+            continue;
+
+        const UINT slot = slot_key.second;
+        ID3D11Resource* resource = tracked_live_srvs[state.srv];
+        state.draw_seen = true;
+        scs_log(0, "[DRAW] draw with tracked live SRV type=%s context=%p bindGeneration=%llu slot=%u srv=%p resource=%p pixelShader=%p %s=%u %s=%u %s=%d",
+            type, pContext, state.generation, slot, state.srv, resource,
+            current_pixel_shaders[pContext],
+            type == "DrawIndexed" ? "IndexCount" : "VertexCount", count,
+            type == "DrawIndexed" ? "StartIndexLocation" : "StartVertexLocation", start,
+            type == "DrawIndexed" ? "BaseVertexLocation" : "Unused", base);
+    }
+}
+
+void HookedDraw(ID3D11DeviceContext* pContext, UINT VertexCount, UINT StartVertexLocation)
+{
+    LogTrackedDraw(pContext, "Draw", VertexCount, StartVertexLocation, 0);
+    Draw_Original(pContext, VertexCount, StartVertexLocation);
+}
+
+void HookedDrawIndexed(ID3D11DeviceContext* pContext, UINT IndexCount,
+    UINT StartIndexLocation, INT BaseVertexLocation)
+{
+    LogTrackedDraw(pContext, "DrawIndexed", IndexCount, StartIndexLocation, BaseVertexLocation);
+    DrawIndexed_Original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
 HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pResource,
@@ -366,6 +423,39 @@ namespace dx11::create_texture_2d {
         if (ps_create_status == MH_OK) {
             MH_STATUS ps_enable_status = MH_EnableHook(psSetShaderResourcesAddr);
             scs_log(0, "[PS] MH_EnableHook status=%s", MH_StatusToString(ps_enable_status));
+        }
+
+        void* psSetShaderAddr = contextVtbl[9];
+        MH_STATUS shader_create_status = MH_CreateHook(psSetShaderAddr, &HookedPSSetShader,
+            reinterpret_cast<LPVOID*>(&PSSetShader_Original));
+        scs_log(0, "[PS] shader hook address=%p MH_CreateHook status=%s original=%p",
+            psSetShaderAddr, MH_StatusToString(shader_create_status),
+            reinterpret_cast<void*>(PSSetShader_Original));
+        if (shader_create_status == MH_OK) {
+            MH_STATUS shader_enable_status = MH_EnableHook(psSetShaderAddr);
+            scs_log(0, "[PS] shader MH_EnableHook status=%s", MH_StatusToString(shader_enable_status));
+        }
+
+        void* drawIndexedAddr = contextVtbl[12];
+        MH_STATUS draw_indexed_create_status = MH_CreateHook(drawIndexedAddr, &HookedDrawIndexed,
+            reinterpret_cast<LPVOID*>(&DrawIndexed_Original));
+        scs_log(0, "[DRAW] DrawIndexed hook address=%p MH_CreateHook status=%s original=%p",
+            drawIndexedAddr, MH_StatusToString(draw_indexed_create_status),
+            reinterpret_cast<void*>(DrawIndexed_Original));
+        if (draw_indexed_create_status == MH_OK) {
+            MH_STATUS draw_indexed_enable_status = MH_EnableHook(drawIndexedAddr);
+            scs_log(0, "[DRAW] DrawIndexed MH_EnableHook status=%s", MH_StatusToString(draw_indexed_enable_status));
+        }
+
+        void* drawAddr = contextVtbl[13];
+        MH_STATUS draw_create_status = MH_CreateHook(drawAddr, &HookedDraw,
+            reinterpret_cast<LPVOID*>(&Draw_Original));
+        scs_log(0, "[DRAW] Draw hook address=%p MH_CreateHook status=%s original=%p",
+            drawAddr, MH_StatusToString(draw_create_status),
+            reinterpret_cast<void*>(Draw_Original));
+        if (draw_create_status == MH_OK) {
+            MH_STATUS draw_enable_status = MH_EnableHook(drawAddr);
+            scs_log(0, "[DRAW] Draw MH_EnableHook status=%s", MH_StatusToString(draw_enable_status));
         }
 
         pDummyContext->Release();
