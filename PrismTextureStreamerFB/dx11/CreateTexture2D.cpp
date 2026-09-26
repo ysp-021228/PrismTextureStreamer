@@ -41,8 +41,9 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 scs_log(0, "[C2D] reject: Height expected %u", screen.override_texture_size_h);
                 continue;
             }
-            if (pDesc->Format != DXGI_FORMAT_BC3_UNORM) {
-                scs_log(0, "[C2D] reject: Format expected %u", DXGI_FORMAT_BC3_UNORM);
+            if (pDesc->Format != DXGI_FORMAT_BC3_UNORM &&
+                pDesc->Format != DXGI_FORMAT_BC3_UNORM_SRGB) {
+                scs_log(0, "[C2D] reject: Format expected BC3_UNORM (77) or BC3_UNORM_SRGB (78)");
                 continue;
             }
             if (pDesc->Usage != D3D11_USAGE_DEFAULT) {
@@ -57,14 +58,25 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 scs_log(0, "[C2D] reject: InitialData not null");
                 continue;
             }
-            if (pDesc->MipLevels != 1) {
-                scs_log(0, "[C2D] reject: MipLevels expected 1");
+            if (pDesc->MipLevels != 1 && pDesc->MipLevels != 12) {
+                scs_log(0, "[C2D] reject: MipLevels expected 1 or 12");
+                continue;
+            }
+            if (pDesc->ArraySize != 1) {
+                scs_log(0, "[C2D] reject: ArraySize expected 1");
                 continue;
             }
 
-            scs_log(0, "[C2D] fingerprint matched");
+            const bool ets2_161_fingerprint =
+                pDesc->Format == DXGI_FORMAT_BC3_UNORM_SRGB && pDesc->MipLevels == 12;
+            scs_log(0, ets2_161_fingerprint
+                ? "[C2D] ETS2 1.61 compatible fingerprint matched"
+                : "[C2D] fingerprint matched");
+            scs_log(0, "[C2D] original Format=%u MipLevels=%u", pDesc->Format, pDesc->MipLevels);
             D3D11_TEXTURE2D_DESC modifiedDesc = *pDesc;
             modifiedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            modifiedDesc.MipLevels = 1;
+            modifiedDesc.ArraySize = 1;
             modifiedDesc.Usage = D3D11_USAGE_DYNAMIC;
             modifiedDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
             modifiedDesc.MiscFlags = 0;
@@ -72,8 +84,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             modifiedDesc.Height = screen.targetLiveTextureHeight;
 
             HRESULT hr = CreateTexture2D_Original(pDevice, &modifiedDesc, pInitialData, ppTexture2D);
-            scs_log(0, "[C2D] original CreateTexture2D HRESULT=0x%08X returned texture ptr=%p",
-                hr, (ppTexture2D ? *ppTexture2D : nullptr));
+            scs_log(0, "[C2D] modified Format=%u MipLevels=%u CreateTexture2D HRESULT=0x%08X returned texture ptr=%p",
+                modifiedDesc.Format, modifiedDesc.MipLevels, hr, (ppTexture2D ? *ppTexture2D : nullptr));
             if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D)
             {
                 if (screen.liveTexture) screen.liveTexture->Release();
@@ -86,7 +98,7 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 screen.liveTexture->AddRef(); // own a ref independent of the games
                 pDevice->GetImmediateContext(&screen.immediateContext);
 
-                scs_log(0, "[C2D] liveTexture assigned ptr=%p immediateContext assigned ptr=%p",
+                scs_log(0, "[C2D] liveTexture assigned successfully ptr=%p immediateContext assigned ptr=%p",
                     screen.liveTexture, screen.immediateContext);
             }
             else {
