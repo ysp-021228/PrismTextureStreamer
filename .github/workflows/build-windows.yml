@@ -1,0 +1,21 @@
+name: Build Windows x64 Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release x64
+        run: msbuild PrismTextureStreamerFB.sln /m /p:Configuration=Release /p:Platform=x64
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrismTextureStreamerFB-windows-x64-Release
+          path: x64/Release/PrismTextureStreamerFB.dll
+          if-no-files-found: error
