@@ -26,8 +26,6 @@ static std::mutex tracked_live_srvs_mutex;
 static std::map<ID3D11ShaderResourceView*, ID3D11Resource*> tracked_live_srvs;
 static std::atomic<uint64_t> ps_set_shader_resources_callback_count{};
 static uint64_t slot14_debug_update_count{};
-static ID3D11ShaderResourceView* last_slot14_debug_srv{};
-static ID3D11ShaderResourceView* latest_inserted_tracked_srv{};
 struct tracked_slot_state_t {
     ID3D11ShaderResourceView* srv{};
     uint64_t generation{};
@@ -62,21 +60,20 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
         const UINT slot = StartSlot + index;
         ID3D11ShaderResourceView* new_srv = ppShaderResourceViews ? ppShaderResourceViews[index] : nullptr;
         if (slot == 14) {
-            const bool found = new_srv != nullptr && tracked_live_srvs.find(new_srv) != tracked_live_srvs.end();
-            const bool should_log = slot14_debug_update_count < 10 || new_srv != last_slot14_debug_srv;
-            if (should_log) {
-                ++slot14_debug_update_count;
-                scs_log(0, "[PSDBG] slot14 update context=%p StartSlot=%u NumViews=%u index=%u srv=%p tracked=%s trackedCount=%zu",
-                    pContext, StartSlot, NumViews, index, new_srv, found ? "true" : "false", tracked_live_srvs.size());
-                if (new_srv != nullptr) {
-                    scs_log(0, "[PSDBG] slot14 tracked lookup %s srv=%p trackedCount=%zu",
-                        found ? "HIT" : "MISS", new_srv, tracked_live_srvs.size());
-                    if (!found && new_srv == latest_inserted_tracked_srv) {
-                        scs_log(2, "[PSDBG] ERROR tracked map lookup inconsistent srv=%p", new_srv);
-                    }
+            const size_t tracked_count = tracked_live_srvs.size();
+            if (tracked_count == 0) {
+                if (slot14_debug_update_count < 5) {
+                    ++slot14_debug_update_count;
+                    scs_log(0, "[PSDBG] slot14 update context=%p StartSlot=%u NumViews=%u index=%u srv=%p tracked=false trackedCount=0",
+                        pContext, StartSlot, NumViews, index, new_srv);
                 }
             }
-            last_slot14_debug_srv = new_srv;
+            else if (tracked_live_srvs.find(new_srv) != tracked_live_srvs.end()) {
+                scs_log(0, "[PSDBG] slot14 update context=%p StartSlot=%u NumViews=%u index=%u srv=%p tracked=true trackedCount=%zu",
+                    pContext, StartSlot, NumViews, index, new_srv, tracked_count);
+                scs_log(0, "[PSDBG] slot14 tracked lookup HIT srv=%p trackedCount=%zu",
+                    new_srv, tracked_count);
+            }
         }
         auto slot_key = std::make_pair(pContext, slot);
         auto previous = tracked_bound_slots.find(slot_key);
@@ -196,7 +193,6 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     if (SUCCEEDED(hr) && ppSRView && *ppSRView) {
         std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
         tracked_live_srvs[*ppSRView] = pResource;
-        latest_inserted_tracked_srv = *ppSRView;
         scs_log(0, "[SRV] tracked live SRV resource=%p srv=%p", pResource, *ppSRView);
         scs_log(0, "[PSDBG] insert tracked SRV srv=%p resource=%p trackedCount=%zu",
             *ppSRView, pResource, tracked_live_srvs.size());
