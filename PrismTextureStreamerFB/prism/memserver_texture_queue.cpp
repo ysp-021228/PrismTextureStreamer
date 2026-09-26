@@ -1,5 +1,7 @@
 #include "prism.h"
 
+#include <atomic>
+
 #include "../bmem.h"
 
 #include "../scs_logging.h"
@@ -9,6 +11,7 @@ using namespace scs_logging;
 
 typedef char(__fastcall* memserver_texture_queue_processor_t)(uint8_t* memserver);
 static memserver_texture_queue_processor_t original_memserver_texture_queue_processor{};
+static std::atomic<bool> gps_override_bypass_logged{};
 
 char memserver_texture_queue_processor(uint8_t* memserver)
 {
@@ -30,17 +33,25 @@ char memserver_texture_queue_processor(uint8_t* memserver)
                 if (screen.original_texture == std::string_view(tobj->m_file_path.m_string))
                 {
                     matched = true;
-                    scs_log(0, "[MEMSERVER] matched original memserver=%p queue_head=%p sentinel=%p node=%p item=%p path_ptr=%p size=%u before='%s'",
-                        memserver, first_node, fake_node, target, tobj, tobj->m_file_path.m_string,
-                        tobj->m_file_path.m_size, tobj->m_file_path.m_string);
-                    scs_log(0, "[MEMSERVER] before replace '%s'", tobj->m_file_path.m_string);
-                    tobj->m_file_path.allocate(screen.override_texture.size() + 1);
-                    memcpy(tobj->m_file_path.m_string, screen.override_texture.data(), screen.override_texture.size());
-                    tobj->m_file_path.m_string[screen.override_texture.size()] = '\0';
+                    if (screen.type == screen_type_t::GPS)
+                    {
+                        if (!gps_override_bypass_logged.exchange(true))
+                            scs_log(0, "[TEST] GPS override bypassed; using original tobj");
+                    }
+                    else
+                    {
+                        scs_log(0, "[MEMSERVER] matched original memserver=%p queue_head=%p sentinel=%p node=%p item=%p path_ptr=%p size=%u before='%s'",
+                            memserver, first_node, fake_node, target, tobj, tobj->m_file_path.m_string,
+                            tobj->m_file_path.m_size, tobj->m_file_path.m_string);
+                        scs_log(0, "[MEMSERVER] before replace '%s'", tobj->m_file_path.m_string);
+                        tobj->m_file_path.allocate(screen.override_texture.size() + 1);
+                        memcpy(tobj->m_file_path.m_string, screen.override_texture.data(), screen.override_texture.size());
+                        tobj->m_file_path.m_string[screen.override_texture.size()] = '\0';
 
-                    tobj->m_file_path.m_size = screen.override_texture.size();
+                        tobj->m_file_path.m_size = screen.override_texture.size();
 
-                    scs_log(0, "[MEMSERVER] after replace '%s'", tobj->m_file_path.m_string);
+                        scs_log(0, "[MEMSERVER] after replace '%s'", tobj->m_file_path.m_string);
+                    }
                 }
             }
 
