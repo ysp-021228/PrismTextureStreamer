@@ -27,6 +27,13 @@ static std::map<ID3D11ShaderResourceView*, ID3D11Resource*> tracked_live_srvs;
 static std::map<ID3D11Resource*, uint64_t> live_texture_epochs;
 static std::map<ID3D11ShaderResourceView*, uint64_t> live_srv_epochs;
 static std::map<ID3D11Resource*, ID3D11ShaderResourceView*> live_resource_srvs;
+struct live_screen_identity_t {
+    const char* screen_type{};
+    std::string original_texture;
+    std::string override_texture;
+};
+static std::map<ID3D11Resource*, live_screen_identity_t> live_screen_identities;
+static std::map<ID3D11ShaderResourceView*, live_screen_identity_t> live_srv_identities;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_bind_counts;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_draw_counts;
 static std::atomic<uint64_t> ps_set_shader_resources_callback_count{};
@@ -44,6 +51,26 @@ typedef void(__stdcall* PSSetShaderResources_t)(ID3D11DeviceContext*, UINT, UINT
 static PSSetShaderResources_t PSSetShaderResources_Original = nullptr;
 typedef void(__stdcall* PSSetShader_t)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
 static PSSetShader_t PSSetShader_Original = nullptr;
+
+static const char* ScreenTypeName(screen_type_t type)
+{
+    switch (type) {
+    case screen_type_t::GPS: return "GPS";
+    case screen_type_t::DASHBOARD: return "DASHBOARD";
+    default: return "CUSTOM";
+    }
+}
+
+static live_screen_identity_t ScreenIdentity(const screen_t& screen)
+{
+    return { ScreenTypeName(screen.type), screen.original_texture, screen.override_texture };
+}
+
+static const live_screen_identity_t* FindResourceIdentity(ID3D11Resource* resource)
+{
+    auto it = live_screen_identities.find(resource);
+    return it == live_screen_identities.end() ? nullptr : &it->second;
+}
 typedef void(__stdcall* Draw_t)(ID3D11DeviceContext*, UINT, UINT);
 static Draw_t Draw_Original = nullptr;
 typedef void(__stdcall* DrawIndexed_t)(ID3D11DeviceContext*, UINT, UINT, INT);
@@ -98,7 +125,11 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
             const uint64_t bind_count = ++display_bind_counts[new_srv];
             if (bind_count == 1 || bind_count % 60 == 0) {
                 const uint64_t epoch = live_srv_epochs.count(new_srv) ? live_srv_epochs[new_srv] : 0;
-                scs_log(0, "[DISPLAYDBG] bind textureEpoch=%llu resource=%p srv=%p slot=%u",
+                const auto* identity = FindResourceIdentity(resource);
+                scs_log(0, "[DISPLAYDBG] bind screenType=%s originalTexture=%s overrideTexture=%s textureEpoch=%llu resource=%p srv=%p slot=%u",
+                    identity ? identity->screen_type : "UNKNOWN",
+                    identity ? identity->original_texture.c_str() : "",
+                    identity ? identity->override_texture.c_str() : "",
                     epoch, resource, new_srv, slot);
             }
         }
@@ -133,9 +164,14 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
         ID3D11Resource* resource = tracked_live_srvs[state.srv];
         const uint64_t draw_count = ++display_draw_counts[state.srv];
         const uint64_t epoch = live_srv_epochs.count(state.srv) ? live_srv_epochs[state.srv] : 0;
-        if (draw_count == 1 || draw_count % 60 == 0)
-            scs_log(0, "[DISPLAYDBG] draw textureEpoch=%llu resource=%p srv=%p slot=%u pixelShader=%p",
+        if (draw_count == 1 || draw_count % 60 == 0) {
+            const auto* identity = FindResourceIdentity(resource);
+            scs_log(0, "[DISPLAYDBG] draw screenType=%s originalTexture=%s overrideTexture=%s textureEpoch=%llu resource=%p srv=%p slot=%u pixelShader=%p",
+                identity ? identity->screen_type : "UNKNOWN",
+                identity ? identity->original_texture.c_str() : "",
+                identity ? identity->override_texture.c_str() : "",
                 epoch, resource, state.srv, slot, current_pixel_shaders[pContext]);
+        }
         if (!state.draw_seen) {
             state.draw_seen = true;
             scs_log(0, "[DRAW] draw with tracked live SRV type=%s context=%p bindGeneration=%llu slot=%u srv=%p resource=%p pixelShader=%p %s=%u %s=%u %s=%d",
@@ -173,7 +209,11 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     if (!matches_live_texture)
         return CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
 
-    scs_log(0, "[SRV] resource matches liveTexture pResource=%p liveTexture=%p pDesc=%p",
+    const auto* resource_identity = FindResourceIdentity(pResource);
+    scs_log(0, "[SRV] resource matches liveTexture screenType=%s originalTexture=%s overrideTexture=%s pResource=%p liveTexture=%p pDesc=%p",
+        resource_identity ? resource_identity->screen_type : "UNKNOWN",
+        resource_identity ? resource_identity->original_texture.c_str() : "",
+        resource_identity ? resource_identity->override_texture.c_str() : "",
         pResource, pResource, pDesc);
     if (!pDesc) {
         scs_log(0, "[SRV] desc=null");
@@ -206,7 +246,10 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     }
 
     HRESULT hr = CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
-    scs_log(SUCCEEDED(hr) ? 0 : 2, "[SRV] CreateShaderResourceView HRESULT=0x%08X returned SRV=%p",
+    scs_log(SUCCEEDED(hr) ? 0 : 2, "[SRV] CreateShaderResourceView screenType=%s originalTexture=%s overrideTexture=%s HRESULT=0x%08X returned SRV=%p",
+        resource_identity ? resource_identity->screen_type : "UNKNOWN",
+        resource_identity ? resource_identity->original_texture.c_str() : "",
+        resource_identity ? resource_identity->override_texture.c_str() : "",
         hr, ppSRView ? *ppSRView : nullptr);
     if (SUCCEEDED(hr) && ppSRView && *ppSRView) {
         std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
@@ -214,8 +257,19 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
         const uint64_t epoch = live_texture_epochs.count(pResource) ? live_texture_epochs[pResource] : 0;
         live_srv_epochs[*ppSRView] = epoch;
         live_resource_srvs[pResource] = *ppSRView;
-        scs_log(0, "[SRV] tracked live SRV resource=%p srv=%p", pResource, *ppSRView);
-        scs_log(0, "[DISPLAYDBG] liveTexture created epoch=%llu texture=%p srv=%p",
+        auto resource_identity = live_screen_identities.find(pResource);
+        if (resource_identity != live_screen_identities.end())
+            live_srv_identities[*ppSRView] = resource_identity->second;
+        const auto* identity = resource_identity != live_screen_identities.end() ? &resource_identity->second : nullptr;
+        scs_log(0, "[SRV] tracked live SRV screenType=%s originalTexture=%s overrideTexture=%s resource=%p srv=%p",
+            identity ? identity->screen_type : "UNKNOWN",
+            identity ? identity->original_texture.c_str() : "",
+            identity ? identity->override_texture.c_str() : "",
+            pResource, *ppSRView);
+        scs_log(0, "[DISPLAYDBG] liveTexture created screenType=%s originalTexture=%s overrideTexture=%s epoch=%llu texture=%p srv=%p",
+            identity ? identity->screen_type : "UNKNOWN",
+            identity ? identity->original_texture.c_str() : "",
+            identity ? identity->override_texture.c_str() : "",
             epoch, pResource, *ppSRView);
         scs_log(0, "[PSDBG] insert tracked SRV srv=%p resource=%p trackedCount=%zu",
             *ppSRView, pResource, tracked_live_srvs.size());
@@ -237,7 +291,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 pDesc->Width != 2048 && pDesc->Height != 2048)
                 continue;
 
-            scs_log(0, "[C2D] candidate %ux%u Format=%u Usage=%u BindFlags=0x%X CPUAccessFlags=0x%X MiscFlags=0x%X MipLevels=%u ArraySize=%u InitialData=%s",
+            scs_log(0, "[C2D] candidate screenType=%s originalTexture=%s overrideTexture=%s %ux%u Format=%u Usage=%u BindFlags=0x%X CPUAccessFlags=0x%X MiscFlags=0x%X MipLevels=%u ArraySize=%u InitialData=%s",
+                ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                 pDesc->Width, pDesc->Height, pDesc->Format, pDesc->Usage, pDesc->BindFlags,
                 pDesc->CPUAccessFlags, pDesc->MiscFlags, pDesc->MipLevels, pDesc->ArraySize,
                 pInitialData ? "not null" : "null");
@@ -279,8 +334,9 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             const bool ets2_161_fingerprint =
                 pDesc->Format == DXGI_FORMAT_BC3_UNORM_SRGB && pDesc->MipLevels == 12;
             scs_log(0, ets2_161_fingerprint
-                ? "[C2D] ETS2 1.61 compatible fingerprint matched"
-                : "[C2D] fingerprint matched");
+                ? "[C2D] ETS2 1.61 compatible fingerprint matched screenType=%s originalTexture=%s overrideTexture=%s"
+                : "[C2D] fingerprint matched screenType=%s originalTexture=%s overrideTexture=%s",
+                ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str());
             scs_log(0, "[C2D] original Format=%u MipLevels=%u", pDesc->Format, pDesc->MipLevels);
             D3D11_TEXTURE2D_DESC modifiedDesc = *pDesc;
             modifiedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -293,12 +349,14 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             modifiedDesc.Height = screen.targetLiveTextureHeight;
 
             HRESULT hr = CreateTexture2D_Original(pDevice, &modifiedDesc, pInitialData, ppTexture2D);
-            scs_log(0, "[C2D] modified Format=%u MipLevels=%u CreateTexture2D HRESULT=0x%08X returned texture ptr=%p",
+            scs_log(0, "[C2D] modified screenType=%s originalTexture=%s overrideTexture=%s Format=%u MipLevels=%u CreateTexture2D HRESULT=0x%08X returned texture ptr=%p",
+                ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                 modifiedDesc.Format, modifiedDesc.MipLevels, hr, (ppTexture2D ? *ppTexture2D : nullptr));
             if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D)
             {
                 if (screen.liveTexture) {
-                    scs_log(0, "[DISPLAYDBG] liveTexture replaced old->null epoch=%llu texture=%p",
+                    scs_log(0, "[DISPLAYDBG] liveTexture replaced screenType=%s originalTexture=%s overrideTexture=%s old->null epoch=%llu texture=%p",
+                        ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                         screen.textureEpoch, screen.liveTexture);
                     scs_log(0, "[FRAME] liveTexture changed old=%p new=null (releasing before replacement)",
                         static_cast<void*>(screen.liveTexture));
@@ -313,9 +371,12 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 ++screen.textureEpoch;
                 {
                     std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
-                    live_texture_epochs[static_cast<ID3D11Resource*>(screen.liveTexture)] = screen.textureEpoch;
+                    ID3D11Resource* resource = static_cast<ID3D11Resource*>(screen.liveTexture);
+                    live_texture_epochs[resource] = screen.textureEpoch;
+                    live_screen_identities[resource] = ScreenIdentity(screen);
                 }
-                scs_log(0, "[DISPLAYDBG] liveTexture epoch assigned epoch=%llu texture=%p",
+                scs_log(0, "[DISPLAYDBG] liveTexture epoch assigned screenType=%s originalTexture=%s overrideTexture=%s epoch=%llu texture=%p",
+                    ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                     screen.textureEpoch, screen.liveTexture);
                 {
                     std::lock_guard<std::mutex> lock(historical_live_textures_mutex);
@@ -479,7 +540,8 @@ void new_frame()
                     auto srv_it = live_resource_srvs.find(static_cast<ID3D11Resource*>(screen.liveTexture));
                     if (srv_it != live_resource_srvs.end()) srv = srv_it->second;
                 }
-                scs_log(0, "[DISPLAYDBG] upload captureGeneration=%llu textureEpoch=%llu liveTexture=%p srv=%p",
+                scs_log(0, "[DISPLAYDBG] upload screenType=%s originalTexture=%s overrideTexture=%s captureGeneration=%llu textureEpoch=%llu liveTexture=%p srv=%p",
+                    ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                     generation, screen.textureEpoch, screen.liveTexture, srv);
             }
             last_uploaded_generation[screen.liveTexture] = generation;
