@@ -33,6 +33,7 @@ struct screen_t
 	bool flipVertical = true;
 
 	ID3D11Texture2D* liveTexture{};
+	uint64_t textureEpoch{};
 	ID3D11DeviceContext* immediateContext{};
 
 	uint8_t framerate = 30; // Framerate of source, can actually be updated live

@@ -24,6 +24,11 @@ static std::mutex historical_live_textures_mutex;
 static std::set<ID3D11Resource*> historical_live_textures;
 static std::mutex tracked_live_srvs_mutex;
 static std::map<ID3D11ShaderResourceView*, ID3D11Resource*> tracked_live_srvs;
+static std::map<ID3D11Resource*, uint64_t> live_texture_epochs;
+static std::map<ID3D11ShaderResourceView*, uint64_t> live_srv_epochs;
+static std::map<ID3D11Resource*, ID3D11ShaderResourceView*> live_resource_srvs;
+static std::map<ID3D11ShaderResourceView*, uint64_t> display_bind_counts;
+static std::map<ID3D11ShaderResourceView*, uint64_t> display_draw_counts;
 static std::atomic<uint64_t> ps_set_shader_resources_callback_count{};
 static uint64_t slot14_debug_update_count{};
 struct tracked_slot_state_t {
@@ -90,6 +95,12 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
                 scs_log(0, "[PS] tracked live SRV bound generation=%llu context=%p StartSlot=%u NumViews=%u index=%u slot=%u srv=%p resource=%p",
                     state.generation, pContext, StartSlot, NumViews, index, slot, new_srv, resource);
             }
+            const uint64_t bind_count = ++display_bind_counts[new_srv];
+            if (bind_count == 1 || bind_count % 60 == 0) {
+                const uint64_t epoch = live_srv_epochs.count(new_srv) ? live_srv_epochs[new_srv] : 0;
+                scs_log(0, "[DISPLAYDBG] bind textureEpoch=%llu resource=%p srv=%p slot=%u",
+                    epoch, resource, new_srv, slot);
+            }
         }
         else if (old_was_tracked) {
             const tracked_slot_state_t state = previous->second;
@@ -115,18 +126,25 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
 {
     std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
     for (auto& [slot_key, state] : tracked_bound_slots) {
-        if (slot_key.first != pContext || state.draw_seen)
+        if (slot_key.first != pContext)
             continue;
 
         const UINT slot = slot_key.second;
         ID3D11Resource* resource = tracked_live_srvs[state.srv];
-        state.draw_seen = true;
-        scs_log(0, "[DRAW] draw with tracked live SRV type=%s context=%p bindGeneration=%llu slot=%u srv=%p resource=%p pixelShader=%p %s=%u %s=%u %s=%d",
-            type, pContext, state.generation, slot, state.srv, resource,
-            current_pixel_shaders[pContext],
-            type == "DrawIndexed" ? "IndexCount" : "VertexCount", count,
-            type == "DrawIndexed" ? "StartIndexLocation" : "StartVertexLocation", start,
-            type == "DrawIndexed" ? "BaseVertexLocation" : "Unused", base);
+        const uint64_t draw_count = ++display_draw_counts[state.srv];
+        const uint64_t epoch = live_srv_epochs.count(state.srv) ? live_srv_epochs[state.srv] : 0;
+        if (draw_count == 1 || draw_count % 60 == 0)
+            scs_log(0, "[DISPLAYDBG] draw textureEpoch=%llu resource=%p srv=%p slot=%u pixelShader=%p",
+                epoch, resource, state.srv, slot, current_pixel_shaders[pContext]);
+        if (!state.draw_seen) {
+            state.draw_seen = true;
+            scs_log(0, "[DRAW] draw with tracked live SRV type=%s context=%p bindGeneration=%llu slot=%u srv=%p resource=%p pixelShader=%p %s=%u %s=%u %s=%d",
+                type, pContext, state.generation, slot, state.srv, resource,
+                current_pixel_shaders[pContext],
+                type == "DrawIndexed" ? "IndexCount" : "VertexCount", count,
+                type == "DrawIndexed" ? "StartIndexLocation" : "StartVertexLocation", start,
+                type == "DrawIndexed" ? "BaseVertexLocation" : "Unused", base);
+        }
     }
 }
 
@@ -193,7 +211,12 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     if (SUCCEEDED(hr) && ppSRView && *ppSRView) {
         std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
         tracked_live_srvs[*ppSRView] = pResource;
+        const uint64_t epoch = live_texture_epochs.count(pResource) ? live_texture_epochs[pResource] : 0;
+        live_srv_epochs[*ppSRView] = epoch;
+        live_resource_srvs[pResource] = *ppSRView;
         scs_log(0, "[SRV] tracked live SRV resource=%p srv=%p", pResource, *ppSRView);
+        scs_log(0, "[DISPLAYDBG] liveTexture created epoch=%llu texture=%p srv=%p",
+            epoch, pResource, *ppSRView);
         scs_log(0, "[PSDBG] insert tracked SRV srv=%p resource=%p trackedCount=%zu",
             *ppSRView, pResource, tracked_live_srvs.size());
     }
@@ -275,6 +298,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             if (SUCCEEDED(hr) && ppTexture2D && *ppTexture2D)
             {
                 if (screen.liveTexture) {
+                    scs_log(0, "[DISPLAYDBG] liveTexture replaced old->null epoch=%llu texture=%p",
+                        screen.textureEpoch, screen.liveTexture);
                     scs_log(0, "[FRAME] liveTexture changed old=%p new=null (releasing before replacement)",
                         static_cast<void*>(screen.liveTexture));
                     screen.liveTexture->Release();
@@ -285,6 +310,13 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 screen.liveTextureHeight = modifiedDesc.Height;
 
                 screen.liveTexture = *ppTexture2D;
+                ++screen.textureEpoch;
+                {
+                    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+                    live_texture_epochs[static_cast<ID3D11Resource*>(screen.liveTexture)] = screen.textureEpoch;
+                }
+                scs_log(0, "[DISPLAYDBG] liveTexture epoch assigned epoch=%llu texture=%p",
+                    screen.textureEpoch, screen.liveTexture);
                 {
                     std::lock_guard<std::mutex> lock(historical_live_textures_mutex);
                     historical_live_textures.insert(static_cast<ID3D11Resource*>(screen.liveTexture));
@@ -440,6 +472,16 @@ void new_frame()
         screen.immediateContext->Unmap(screen.liveTexture, 0);
         if (last_uploaded_generation[screen.liveTexture] != generation) {
             scs_log(0, "[FRAMEUPD] uploaded generation=%llu", generation);
+            if (generation % 60 == 0) {
+                ID3D11ShaderResourceView* srv = nullptr;
+                {
+                    std::lock_guard<std::mutex> display_lock(tracked_live_srvs_mutex);
+                    auto srv_it = live_resource_srvs.find(static_cast<ID3D11Resource*>(screen.liveTexture));
+                    if (srv_it != live_resource_srvs.end()) srv = srv_it->second;
+                }
+                scs_log(0, "[DISPLAYDBG] upload captureGeneration=%llu textureEpoch=%llu liveTexture=%p srv=%p",
+                    generation, screen.textureEpoch, screen.liveTexture, srv);
+            }
             last_uploaded_generation[screen.liveTexture] = generation;
         }
         if (upload_completed_logged.insert(screen.liveTexture).second)
