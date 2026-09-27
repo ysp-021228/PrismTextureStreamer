@@ -342,8 +342,9 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
             modifiedDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             modifiedDesc.MipLevels = 1;
             modifiedDesc.ArraySize = 1;
-            modifiedDesc.Usage = D3D11_USAGE_DYNAMIC;
-            modifiedDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            const bool is_gps = screen.type == screen_type_t::GPS;
+            modifiedDesc.Usage = is_gps ? D3D11_USAGE_DEFAULT : D3D11_USAGE_DYNAMIC;
+            modifiedDesc.CPUAccessFlags = is_gps ? 0 : D3D11_CPU_ACCESS_WRITE;
             modifiedDesc.MiscFlags = 0;
             modifiedDesc.Width = screen.targetLiveTextureWidth;
             modifiedDesc.Height = screen.targetLiveTextureHeight;
@@ -411,6 +412,7 @@ void new_frame()
     static std::set<ID3D11Texture2D*> upload_completed_logged;
     static std::map<ID3D11Texture2D*, uint64_t> last_uploaded_generation;
     static std::map<ID3D11Texture2D*, std::vector<uint8_t>> previous_samples;
+    static std::set<ID3D11Texture2D*> update_test_logged;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -495,30 +497,40 @@ void new_frame()
         if (srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
             continue;
 
+        const bool is_gps = screen.type == screen_type_t::GPS;
+        std::vector<uint8_t> final_rgba_buffer;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT map_hr = screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        const bool map_succeeded = SUCCEEDED(map_hr);
-        auto map_state = map_result_logged.find(screen.liveTexture);
-        if (map_state == map_result_logged.end() || map_state->second != map_succeeded) {
-            map_result_logged[screen.liveTexture] = map_succeeded;
-            scs_log(map_succeeded ? 0 : 2, "[FRAME] Map HRESULT=0x%08X MappedResource.pData=%p RowPitch=%u",
-                map_hr, mapped.pData, mapped.RowPitch);
+        if (is_gps) {
+            final_rgba_buffer.resize(static_cast<size_t>(dstWidth) * dstHeight * 4);
+            if (update_test_logged.insert(screen.liveTexture).second)
+                scs_log(0, "[UPDATE_TEST] GPS liveTexture uses D3D11_USAGE_DEFAULT");
         }
-        if (!map_succeeded)
-            continue;
+        else {
+            HRESULT map_hr = screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            const bool map_succeeded = SUCCEEDED(map_hr);
+            auto map_state = map_result_logged.find(screen.liveTexture);
+            if (map_state == map_result_logged.end() || map_state->second != map_succeeded) {
+                map_result_logged[screen.liveTexture] = map_succeeded;
+                scs_log(map_succeeded ? 0 : 2, "[FRAME] Map HRESULT=0x%08X MappedResource.pData=%p RowPitch=%u",
+                    map_hr, mapped.pData, mapped.RowPitch);
+            }
+            if (!map_succeeded)
+                continue;
+        }
 
         if (upload_started_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] copying frame to liveTexture");
 
         const uint8_t* src = screen.frameScratch.data();
-        uint8_t* dstBase = static_cast<uint8_t*>(mapped.pData);
+        uint8_t* dstBase = is_gps ? final_rgba_buffer.data() : static_cast<uint8_t*>(mapped.pData);
+        const UINT dstRowPitch = is_gps ? dstWidth * 4 : mapped.RowPitch;
 
         for (UINT y = 0; y < dstHeight; ++y)
         {
             const UINT srcY = static_cast<UINT>(static_cast<uint64_t>(y) * srcHeight / dstHeight);
             const UINT dstRow = screen.flipVertical ? (dstHeight - 1 - y) : y;
             const uint8_t* srcRow = src + static_cast<size_t>(srcY) * srcWidth * 4;
-            uint8_t* dstRowPtr = dstBase + static_cast<size_t>(dstRow) * mapped.RowPitch;
+            uint8_t* dstRowPtr = dstBase + static_cast<size_t>(dstRow) * dstRowPitch;
 
             if (srcWidth == dstWidth) {
                 memcpy(dstRowPtr, srcRow, static_cast<size_t>(dstWidth) * 4);
@@ -530,7 +542,13 @@ void new_frame()
             }
         }
 
-        screen.immediateContext->Unmap(screen.liveTexture, 0);
+        if (is_gps) {
+            screen.immediateContext->UpdateSubresource(
+                screen.liveTexture, 0, nullptr, final_rgba_buffer.data(), dstWidth * 4, 0);
+        }
+        else {
+            screen.immediateContext->Unmap(screen.liveTexture, 0);
+        }
         if (last_uploaded_generation[screen.liveTexture] != generation) {
             scs_log(0, "[FRAMEUPD] uploaded generation=%llu", generation);
             if (generation % 60 == 0) {
@@ -539,6 +557,10 @@ void new_frame()
                     std::lock_guard<std::mutex> display_lock(tracked_live_srvs_mutex);
                     auto srv_it = live_resource_srvs.find(static_cast<ID3D11Resource*>(screen.liveTexture));
                     if (srv_it != live_resource_srvs.end()) srv = srv_it->second;
+                }
+                if (is_gps) {
+                    scs_log(0, "[UPDATE_TEST] UpdateSubresource generation=%llu texture=%p width=%u height=%u rowPitch=%u",
+                        generation, screen.liveTexture, dstWidth, dstHeight, dstWidth * 4);
                 }
                 scs_log(0, "[DISPLAYDBG] upload screenType=%s originalTexture=%s overrideTexture=%s captureGeneration=%llu textureEpoch=%llu liveTexture=%p srv=%p",
                     ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
