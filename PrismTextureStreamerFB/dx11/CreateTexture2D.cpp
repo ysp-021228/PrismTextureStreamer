@@ -42,6 +42,7 @@ struct live_screen_identity_t {
 static std::map<ID3D11Resource*, live_screen_identity_t> live_screen_identities;
 static std::set<ID3D11Resource*> current_gps_live_textures;
 static std::set<ID3D11Resource*> gps_downstream_resources;
+static std::set<ID3D11Resource*> gps_render_target_resources;
 static std::atomic<uint64_t> latest_gps_capture_generation{};
 static std::map<ID3D11ShaderResourceView*, live_screen_identity_t> live_srv_identities;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_bind_counts;
@@ -90,13 +91,17 @@ static bool IsGpsResource(ID3D11Resource* resource)
 static void LogCopyFlow(const char* api, ID3D11Resource* src, ID3D11Resource* dst,
     bool gps_is_src, bool gps_is_dst)
 {
-    if (!gps_is_src && !gps_is_dst)
+    const bool render_target_is_src = gps_render_target_resources.count(src) != 0;
+    const bool render_target_is_dst = gps_render_target_resources.count(dst) != 0;
+    if (!gps_is_src && !gps_is_dst && !render_target_is_src && !render_target_is_dst)
         return;
     scs_log(0, "[COPYDBG] api=%s src=%p dst=%p gpsIsSrc=%s gpsIsDst=%s captureGeneration=%llu",
         api, src, dst, gps_is_src ? "true" : "false", gps_is_dst ? "true" : "false",
         latest_gps_capture_generation.load());
     if (gps_is_src && !gps_is_dst)
         gps_downstream_resources.insert(dst);
+    if (render_target_is_src && !render_target_is_dst)
+        scs_log(0, "[RTDBG] renderTarget copy api=%s src=%p dst=%p", api, src, dst);
 }
 
 typedef void(__stdcall* Draw_t)(ID3D11DeviceContext*, UINT, UINT);
@@ -187,8 +192,8 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
                     identity ? identity->original_texture.c_str() : "",
                     identity ? identity->override_texture.c_str() : "",
                     epoch, resource, new_srv, slot);
-                if (gps_downstream_resources.count(resource) != 0)
-                    scs_log(0, "[COPYDBG] downstream bind resource=%p srv=%p slot=%u", resource, new_srv, slot);
+                if (gps_downstream_resources.count(resource) != 0 || gps_render_target_resources.count(resource) != 0)
+                    scs_log(0, "[RTDBG] downstream bind resource=%p srv=%p slot=%u", resource, new_srv, slot);
             }
         }
         else if (old_was_tracked) {
@@ -222,14 +227,31 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
         ID3D11Resource* resource = tracked_live_srvs[state.srv];
         const uint64_t draw_count = ++display_draw_counts[state.srv];
         const uint64_t epoch = live_srv_epochs.count(state.srv) ? live_srv_epochs[state.srv] : 0;
+        const auto* identity = FindResourceIdentity(resource);
+        const bool is_gps_live_draw = identity && strcmp(identity->screen_type, "GPS") == 0 &&
+            current_gps_live_textures.count(resource) != 0;
+        if (is_gps_live_draw && (draw_count == 1 || draw_count % 60 == 0)) {
+            ID3D11RenderTargetView* rtv = nullptr;
+            ID3D11Resource* render_target_resource = nullptr;
+            pContext->OMGetRenderTargets(1, &rtv, nullptr);
+            if (rtv)
+                rtv->GetResource(&render_target_resource);
+            scs_log(0, "[RTDBG] gpsTexture=%p gpsSrv=%p gpsSlot=%u drawType=%s rtv=%p renderTargetResource=%p pixelShader=%p",
+                resource, state.srv, slot, type, rtv, render_target_resource, current_pixel_shaders[pContext]);
+            if (render_target_resource)
+                gps_render_target_resources.insert(render_target_resource);
+            if (render_target_resource)
+                render_target_resource->Release();
+            if (rtv)
+                rtv->Release();
+        }
         if (draw_count == 1 || draw_count % 60 == 0) {
-            const auto* identity = FindResourceIdentity(resource);
             scs_log(0, "[DISPLAYDBG] draw screenType=%s originalTexture=%s overrideTexture=%s textureEpoch=%llu resource=%p srv=%p slot=%u pixelShader=%p",
                 identity ? identity->screen_type : "UNKNOWN",
                 identity ? identity->original_texture.c_str() : "",
                 identity ? identity->override_texture.c_str() : "",
                 epoch, resource, state.srv, slot, current_pixel_shaders[pContext]);
-            if (gps_downstream_resources.count(resource) != 0)
+                if (gps_downstream_resources.count(resource) != 0 || gps_render_target_resources.count(resource) != 0)
                 scs_log(0, "[COPYDBG] downstream draw resource=%p srv=%p slot=%u", resource, state.srv, slot);
         }
         if (!state.draw_seen) {
@@ -267,12 +289,13 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
     }
 
     const bool matches_gps_downstream = gps_downstream_resources.count(pResource) != 0;
-    if (!matches_live_texture && !matches_gps_downstream)
+    const bool matches_gps_render_target = gps_render_target_resources.count(pResource) != 0;
+    if (!matches_live_texture && !matches_gps_downstream && !matches_gps_render_target)
         return CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
 
     const auto* resource_identity = FindResourceIdentity(pResource);
     scs_log(0, "[SRV] resource matches %s screenType=%s originalTexture=%s overrideTexture=%s pResource=%p liveTexture=%p pDesc=%p",
-        matches_gps_downstream ? "GPS downstream" : "liveTexture",
+        matches_gps_render_target ? "GPS renderTarget" : (matches_gps_downstream ? "GPS downstream" : "liveTexture"),
         resource_identity ? resource_identity->screen_type : "UNKNOWN",
         resource_identity ? resource_identity->original_texture.c_str() : "",
         resource_identity ? resource_identity->override_texture.c_str() : "",
@@ -317,8 +340,9 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
         std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
         tracked_live_srvs[*ppSRView] = pResource;
         const uint64_t epoch = live_texture_epochs.count(pResource) ? live_texture_epochs[pResource] : 0;
-        if (matches_gps_downstream)
-            scs_log(0, "[COPYDBG] downstream SRV created resource=%p srv=%p", pResource, *ppSRView);
+        if (matches_gps_downstream || matches_gps_render_target)
+            scs_log(0, "[RTDBG] downstream SRV created resource=%p srv=%p renderTarget=%s",
+                pResource, *ppSRView, matches_gps_render_target ? "true" : "false");
         live_srv_epochs[*ppSRView] = epoch;
         live_resource_srvs[pResource] = *ppSRView;
         auto resource_identity = live_screen_identities.find(pResource);
