@@ -22,6 +22,7 @@ namespace sources {
         std::mutex m_bufferMutex;
 
         std::atomic<bool> m_haveFrame{};
+        std::atomic<uint64_t> m_frameGeneration{};
 
         std::thread m_thread;
         std::atomic<bool> m_stopRequested{};
@@ -98,6 +99,11 @@ namespace sources {
                         dst[i * 4 + 3] = 255;
                     }
                     m_haveFrame = true;
+                    const uint64_t generation = m_frameGeneration.fetch_add(1) + 1;
+                    if (generation == 1 || generation == 2 || generation == 3 || generation == 10 ||
+                        generation == 100 || generation == 500)
+                        scs_log(0, "[CAPTUREDBG] new source frame backend=Legacy generation=%llu width=%u height=%u",
+                            generation, width, height);
                 }
 
                 m_width = width;
@@ -148,6 +154,8 @@ namespace sources {
         uint32_t GetWidth() const override { return m_width.load(); }
         uint32_t GetHeight() const override { return m_height.load(); }
         void SetFramerate(uint8_t framerate) override { m_framerate = framerate; }
+        uint64_t GetFrameGeneration() const override { return m_frameGeneration.load(); }
+        const char* GetBackendName() const override { return "Legacy"; }
 
         bool CopyLatestFrame(std::vector<uint8_t>& dst) override
         {

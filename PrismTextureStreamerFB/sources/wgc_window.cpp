@@ -120,6 +120,7 @@ namespace sources {
         std::mutex m_frameMutex; // Stops the frame arrived running for things like destruction
 
         std::atomic<bool> m_haveFrame{};
+        std::atomic<uint64_t> m_frameGeneration{};
         std::atomic<bool> m_stopping{};
 
 
@@ -187,6 +188,11 @@ namespace sources {
                     m_height = desc.Height;
                     ctx->Unmap(staging.get(), 0);
                     m_haveFrame = true;
+                    const uint64_t generation = m_frameGeneration.fetch_add(1) + 1;
+                    if (generation == 1 || generation == 2 || generation == 3 || generation == 10 ||
+                        generation == 100 || generation == 500)
+                        scs_log(0, "[CAPTUREDBG] new source frame backend=WGC generation=%llu width=%u height=%u",
+                            generation, desc.Width, desc.Height);
                 }
             }
             catch (const winrt::hresult_error& e) {
@@ -267,6 +273,8 @@ namespace sources {
         uint32_t GetWidth() const override { return m_width.load(); }
         uint32_t GetHeight() const override { return m_height.load(); }
         void SetFramerate(uint8_t framerate) override {  }
+        uint64_t GetFrameGeneration() const override { return m_frameGeneration.load(); }
+        const char* GetBackendName() const override { return "WGC"; }
 
         bool CopyLatestFrame(std::vector<uint8_t>& dst) override
         {

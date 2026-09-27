@@ -316,6 +316,8 @@ void new_frame()
     static std::map<ID3D11Texture2D*, bool> map_result_logged;
     static std::set<ID3D11Texture2D*> upload_started_logged;
     static std::set<ID3D11Texture2D*> upload_completed_logged;
+    static std::map<ID3D11Texture2D*, uint64_t> last_uploaded_generation;
+    static std::map<ID3D11Texture2D*, uint64_t> last_frameupd_generation;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -347,7 +349,9 @@ void new_frame()
         if (!screen.liveTexture || !screen.immediateContext)
             continue;
 
+        const uint64_t generation_before_copy = screen.source->GetFrameGeneration();
         const bool copy_succeeded = screen.source->CopyLatestFrame(screen.frameScratch);
+        const uint64_t generation_after_copy = screen.source->GetFrameGeneration();
         const UINT srcWidth = screen.source->GetWidth();
         const UINT srcHeight = screen.source->GetHeight();
         const bool buffer_present = !screen.frameScratch.empty() && screen.frameScratch.data() != nullptr;
@@ -360,6 +364,25 @@ void new_frame()
         }
         if (!copy_succeeded)
             continue;
+
+        const uint64_t generation = generation_after_copy;
+        const auto previous_frameupd = last_frameupd_generation.find(screen.liveTexture);
+        const bool generation_changed = previous_frameupd == last_frameupd_generation.end() ||
+            previous_frameupd->second != generation;
+        if (generation != 0 && generation_changed) {
+            uint32_t sample_hash = 2166136261u;
+            for (size_t offset : { size_t(0), screen.frameScratch.size() / 2,
+                                   screen.frameScratch.size() > 4 ? screen.frameScratch.size() - 4 : size_t(0) }) {
+                if (offset + 4 <= screen.frameScratch.size()) {
+                    for (size_t i = 0; i < 4; ++i)
+                        sample_hash = (sample_hash ^ screen.frameScratch[offset + i]) * 16777619u;
+                }
+            }
+            scs_log(0, "[FRAMEUPD] CopyLatestFrame generation=%llu changed=%s sampleHash=%u buffer=%p backend=%s",
+                generation, generation_changed ? "true" : "false", sample_hash,
+                screen.frameScratch.data(), screen.source->GetBackendName());
+            last_frameupd_generation[screen.liveTexture] = generation;
+        }
 
         const UINT dstWidth = screen.liveTextureWidth;
         const UINT dstHeight = screen.liveTextureHeight;
@@ -402,6 +425,10 @@ void new_frame()
         }
 
         screen.immediateContext->Unmap(screen.liveTexture, 0);
+        if (last_uploaded_generation[screen.liveTexture] != generation) {
+            scs_log(0, "[FRAMEUPD] uploaded generation=%llu", generation);
+            last_uploaded_generation[screen.liveTexture] = generation;
+        }
         if (upload_completed_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] frame upload completed");
     }

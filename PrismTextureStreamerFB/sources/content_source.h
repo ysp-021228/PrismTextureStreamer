@@ -14,4 +14,6 @@ public:
 
     virtual void SetFramerate(uint8_t framerate) = 0;
     virtual bool CopyLatestFrame(std::vector<uint8_t>& dst) = 0;
+    virtual uint64_t GetFrameGeneration() const = 0;
+    virtual const char* GetBackendName() const = 0;
 };
