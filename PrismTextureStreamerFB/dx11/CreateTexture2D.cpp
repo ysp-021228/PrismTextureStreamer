@@ -2,6 +2,8 @@
 #include <d3d11.h>
 
 #include <atomic>
+#include <algorithm>
+#include <cstdio>
 #include <MinHook/MinHook.h>
 
 #include <map>
@@ -525,6 +527,11 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                 screen.liveTextureHeight = modifiedDesc.Height;
 
                 screen.liveTexture = *ppTexture2D;
+                if (screen.type == screen_type_t::GPS &&
+                    std::find(screen.gpsLiveTextures.begin(), screen.gpsLiveTextures.end(), screen.liveTexture) == screen.gpsLiveTextures.end()) {
+                    screen.liveTexture->AddRef();
+                    screen.gpsLiveTextures.push_back(screen.liveTexture);
+                }
                 ++screen.textureEpoch;
                 {
                     std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
@@ -565,10 +572,6 @@ void new_frame()
     static std::set<ID3D11Texture2D*> post_live_texture_logged;
     static std::map<std::string, ID3D11Texture2D*> previous_live_texture;
     static std::map<ID3D11Texture2D*, bool> copy_result_logged;
-    static std::map<ID3D11Texture2D*, bool> map_result_logged;
-    static std::set<ID3D11Texture2D*> upload_started_logged;
-    static std::set<ID3D11Texture2D*> upload_completed_logged;
-    static std::map<ID3D11Texture2D*, uint64_t> last_uploaded_generation;
     static std::map<ID3D11Texture2D*, std::vector<uint8_t>> previous_samples;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
@@ -654,61 +657,60 @@ void new_frame()
         if (srcWidth == 0 || srcHeight == 0 || dstWidth == 0 || dstHeight == 0)
             continue;
 
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT map_hr = screen.immediateContext->Map(screen.liveTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        const bool map_succeeded = SUCCEEDED(map_hr);
-        auto map_state = map_result_logged.find(screen.liveTexture);
-        if (map_state == map_result_logged.end() || map_state->second != map_succeeded) {
-            map_result_logged[screen.liveTexture] = map_succeeded;
-            scs_log(map_succeeded ? 0 : 2, "[FRAME] Map HRESULT=0x%08X MappedResource.pData=%p RowPitch=%u",
-                map_hr, mapped.pData, mapped.RowPitch);
-        }
-        if (!map_succeeded)
-            continue;
-
-        if (upload_started_logged.insert(screen.liveTexture).second)
-            scs_log(0, "[FRAME] copying frame to liveTexture");
-
+        screen.uploadScratch.resize(static_cast<size_t>(dstWidth) * dstHeight * 4);
         const uint8_t* src = screen.frameScratch.data();
-        uint8_t* dstBase = static_cast<uint8_t*>(mapped.pData);
-
-        for (UINT y = 0; y < dstHeight; ++y)
-        {
+        uint8_t* packed = screen.uploadScratch.data();
+        for (UINT y = 0; y < dstHeight; ++y) {
             const UINT srcY = static_cast<UINT>(static_cast<uint64_t>(y) * srcHeight / dstHeight);
             const UINT dstRow = screen.flipVertical ? (dstHeight - 1 - y) : y;
             const uint8_t* srcRow = src + static_cast<size_t>(srcY) * srcWidth * 4;
-            uint8_t* dstRowPtr = dstBase + static_cast<size_t>(dstRow) * mapped.RowPitch;
-
+            uint8_t* dstRowPtr = packed + static_cast<size_t>(dstRow) * dstWidth * 4;
             if (srcWidth == dstWidth) {
                 memcpy(dstRowPtr, srcRow, static_cast<size_t>(dstWidth) * 4);
                 continue;
             }
             for (UINT x = 0; x < dstWidth; ++x) {
                 const UINT srcX = static_cast<UINT>(static_cast<uint64_t>(x) * srcWidth / dstWidth);
-                memcpy(dstRowPtr + static_cast<size_t>(x) * 4, srcRow + static_cast<size_t>(srcX) * 4, 4);
+                memcpy(dstRowPtr + static_cast<size_t>(x) * 4,
+                    srcRow + static_cast<size_t>(srcX) * 4, 4);
             }
         }
 
-        screen.immediateContext->Unmap(screen.liveTexture, 0);
-        if (last_uploaded_generation[screen.liveTexture] != generation) {
-            scs_log(0, "[FRAMEUPD] uploaded generation=%llu", generation);
-            if (generation % 60 == 0) {
-                ID3D11ShaderResourceView* srv = nullptr;
-                {
-                    std::lock_guard<std::mutex> display_lock(tracked_live_srvs_mutex);
-                    auto srv_it = live_resource_srvs.find(static_cast<ID3D11Resource*>(screen.liveTexture));
-                    if (srv_it != live_resource_srvs.end()) srv = srv_it->second;
-                }
-                scs_log(0, "[DISPLAYDBG] upload screenType=%s originalTexture=%s overrideTexture=%s captureGeneration=%llu textureEpoch=%llu liveTexture=%p srv=%p",
-                    ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
-                    generation, screen.textureEpoch, screen.liveTexture, srv);
+        std::vector<ID3D11Texture2D*> single_target;
+        std::vector<ID3D11Texture2D*>* targets = &single_target;
+        if (screen.type == screen_type_t::GPS)
+            targets = &screen.gpsLiveTextures;
+        else if (screen.liveTexture)
+            single_target.push_back(screen.liveTexture);
+        const size_t target_count = targets->size();
+        size_t updated_count = 0;
+        for (size_t target_index = 0; target_index < targets->size(); ++target_index) {
+            ID3D11Texture2D* target = (*targets)[target_index];
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            const HRESULT map_hr = screen.immediateContext->Map(target, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (FAILED(map_hr)) {
+                scs_log(2, "[MULTIGPS] Map failed texture=%p HRESULT=0x%08X", target, map_hr);
+                continue;
             }
-            last_uploaded_generation[screen.liveTexture] = generation;
-            if (screen.type == screen_type_t::GPS)
-                latest_gps_capture_generation.store(generation);
+            for (UINT y = 0; y < dstHeight; ++y)
+                memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+                    packed + static_cast<size_t>(y) * dstWidth * 4, static_cast<size_t>(dstWidth) * 4);
+            screen.immediateContext->Unmap(target, 0);
+            ++updated_count;
         }
-        if (upload_completed_logged.insert(screen.liveTexture).second)
-            scs_log(0, "[FRAME] frame upload completed");
+        if (screen.type == screen_type_t::GPS && generation % 60 == 0) {
+            std::string texture_list;
+            for (ID3D11Texture2D* texture : *targets) {
+                char pointer_text[32]{};
+                snprintf(pointer_text, sizeof(pointer_text), "%p", texture);
+                if (!texture_list.empty()) texture_list += ",";
+                texture_list += pointer_text;
+            }
+            scs_log(0, "[MULTIGPS] generation=%llu textureCount=%zu updatedCount=%zu textures=%s",
+                generation, target_count, updated_count, texture_list.c_str());
+        }
+        if (screen.type == screen_type_t::GPS)
+            latest_gps_capture_generation.store(generation);
     }
 }
 

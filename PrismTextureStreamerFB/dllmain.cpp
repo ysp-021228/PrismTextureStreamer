@@ -165,6 +165,9 @@ SCSAPI_VOID scs_telemetry_shutdown()
         std::lock_guard<std::mutex> lock(g_screens_mutex);
         for (auto& screen : g_screens)
         {
+            for (ID3D11Texture2D* texture : screen.gpsLiveTextures)
+                texture->Release();
+            screen.gpsLiveTextures.clear();
             if (screen.liveTexture) screen.liveTexture->Release();
             if (screen.immediateContext) screen.immediateContext->Release();
         }

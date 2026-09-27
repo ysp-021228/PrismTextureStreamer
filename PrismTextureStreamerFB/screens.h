@@ -29,6 +29,8 @@ struct screen_t
 	std::string source_application_display_name;
 	std::unique_ptr<IContentSource> source;
 	std::vector<uint8_t> frameScratch;
+	std::vector<uint8_t> uploadScratch;
+	std::vector<ID3D11Texture2D*> gpsLiveTextures;
 	bool legacyCapture = false;
 	bool flipVertical = true;
 

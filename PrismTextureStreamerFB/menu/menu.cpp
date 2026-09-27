@@ -357,6 +357,9 @@ void on_frame()
 
 					if (ImGui::Button("Remove")) {
 
+						for (ID3D11Texture2D* texture : screen.gpsLiveTextures)
+							texture->Release();
+						screen.gpsLiveTextures.clear();
 						if (screen.liveTexture) screen.liveTexture->Release();
 						if (screen.immediateContext) screen.immediateContext->Release();
 
