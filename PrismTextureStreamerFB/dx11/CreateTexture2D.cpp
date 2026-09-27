@@ -108,6 +108,16 @@ typedef void(__stdcall* Draw_t)(ID3D11DeviceContext*, UINT, UINT);
 static Draw_t Draw_Original = nullptr;
 typedef void(__stdcall* DrawIndexed_t)(ID3D11DeviceContext*, UINT, UINT, INT);
 static DrawIndexed_t DrawIndexed_Original = nullptr;
+typedef void(__stdcall* DrawIndexedInstanced_t)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+static DrawIndexedInstanced_t DrawIndexedInstanced_Original = nullptr;
+typedef void(__stdcall* DrawInstanced_t)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
+static DrawInstanced_t DrawInstanced_Original = nullptr;
+typedef void(__stdcall* DrawAuto_t)(ID3D11DeviceContext*);
+static DrawAuto_t DrawAuto_Original = nullptr;
+typedef void(__stdcall* DrawIndexedInstancedIndirect_t)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+static DrawIndexedInstancedIndirect_t DrawIndexedInstancedIndirect_Original = nullptr;
+typedef void(__stdcall* DrawInstancedIndirect_t)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+static DrawInstancedIndirect_t DrawInstancedIndirect_Original = nullptr;
 
 void HookedCopyResource(ID3D11DeviceContext* pContext, ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource)
 {
@@ -277,6 +287,61 @@ void HookedDrawIndexed(ID3D11DeviceContext* pContext, UINT IndexCount,
 {
     LogTrackedDraw(pContext, "DrawIndexed", IndexCount, StartIndexLocation, BaseVertexLocation);
     DrawIndexed_Original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+}
+
+static void LogGpsDrawVariant(ID3D11DeviceContext* pContext, const char* type)
+{
+    static std::map<std::pair<std::string, ID3D11ShaderResourceView*>, uint64_t> counts;
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+    for (const auto& [slot_key, state] : tracked_bound_slots) {
+        if (slot_key.first != pContext)
+            continue;
+        ID3D11Resource* resource = tracked_live_srvs[state.srv];
+        const auto* identity = FindResourceIdentity(resource);
+        if (!identity || strcmp(identity->screen_type, "GPS") != 0 ||
+            current_gps_live_textures.count(resource) == 0)
+            continue;
+        const uint64_t count = ++counts[{ type, state.srv }];
+        if (count == 1 || count % 60 == 0)
+            scs_log(0, "[DRAWVAR] type=%s srv=%p resource=%p slot=%u pixelShader=%p count=%llu",
+                type, state.srv, resource, slot_key.second, current_pixel_shaders[pContext], count);
+    }
+}
+
+void HookedDrawIndexedInstanced(ID3D11DeviceContext* pContext, UINT IndexCountPerInstance,
+    UINT InstanceCount, UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
+{
+    LogGpsDrawVariant(pContext, "DrawIndexedInstanced");
+    DrawIndexedInstanced_Original(pContext, IndexCountPerInstance, InstanceCount, StartIndexLocation,
+        BaseVertexLocation, StartInstanceLocation);
+}
+
+void HookedDrawInstanced(ID3D11DeviceContext* pContext, UINT VertexCountPerInstance,
+    UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation)
+{
+    LogGpsDrawVariant(pContext, "DrawInstanced");
+    DrawInstanced_Original(pContext, VertexCountPerInstance, InstanceCount, StartVertexLocation,
+        StartInstanceLocation);
+}
+
+void HookedDrawAuto(ID3D11DeviceContext* pContext)
+{
+    LogGpsDrawVariant(pContext, "DrawAuto");
+    DrawAuto_Original(pContext);
+}
+
+void HookedDrawIndexedInstancedIndirect(ID3D11DeviceContext* pContext,
+    ID3D11Buffer* pBufferForArgs, UINT AlignedByteOffsetForArgs)
+{
+    LogGpsDrawVariant(pContext, "DrawIndexedInstancedIndirect");
+    DrawIndexedInstancedIndirect_Original(pContext, pBufferForArgs, AlignedByteOffsetForArgs);
+}
+
+void HookedDrawInstancedIndirect(ID3D11DeviceContext* pContext,
+    ID3D11Buffer* pBufferForArgs, UINT AlignedByteOffsetForArgs)
+{
+    LogGpsDrawVariant(pContext, "DrawInstancedIndirect");
+    DrawInstancedIndirect_Original(pContext, pBufferForArgs, AlignedByteOffsetForArgs);
 }
 
 HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pResource,
@@ -749,6 +814,28 @@ namespace dx11::create_texture_2d {
         if (draw_create_status == MH_OK) {
             MH_STATUS draw_enable_status = MH_EnableHook(drawAddr);
             scs_log(0, "[DRAW] Draw MH_EnableHook status=%s", MH_StatusToString(draw_enable_status));
+        }
+
+        struct draw_variant_hook_t {
+            UINT vtable_index;
+            const char* name;
+            void* detour;
+            void** original;
+        };
+        draw_variant_hook_t draw_variant_hooks[] = {
+            { 20, "DrawIndexedInstanced", reinterpret_cast<void*>(&HookedDrawIndexedInstanced), reinterpret_cast<void**>(&DrawIndexedInstanced_Original) },
+            { 21, "DrawInstanced", reinterpret_cast<void*>(&HookedDrawInstanced), reinterpret_cast<void**>(&DrawInstanced_Original) },
+            { 38, "DrawAuto", reinterpret_cast<void*>(&HookedDrawAuto), reinterpret_cast<void**>(&DrawAuto_Original) },
+            { 39, "DrawIndexedInstancedIndirect", reinterpret_cast<void*>(&HookedDrawIndexedInstancedIndirect), reinterpret_cast<void**>(&DrawIndexedInstancedIndirect_Original) },
+            { 40, "DrawInstancedIndirect", reinterpret_cast<void*>(&HookedDrawInstancedIndirect), reinterpret_cast<void**>(&DrawInstancedIndirect_Original) },
+        };
+        for (const auto& hook : draw_variant_hooks) {
+            void* address = contextVtbl[hook.vtable_index];
+            const MH_STATUS create_status = MH_CreateHook(address, hook.detour, hook.original);
+            if (create_status == MH_OK)
+                MH_EnableHook(address);
+            scs_log(0, "[DRAWVAR] hook type=%s vtableIndex=%u status=%s address=%p",
+                hook.name, hook.vtable_index, MH_StatusToString(create_status), address);
         }
 
         pDummyContext->Release();
