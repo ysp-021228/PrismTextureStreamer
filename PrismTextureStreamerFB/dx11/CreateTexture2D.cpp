@@ -33,6 +33,7 @@ struct live_screen_identity_t {
     std::string override_texture;
 };
 static std::map<ID3D11Resource*, live_screen_identity_t> live_screen_identities;
+static std::set<ID3D11Resource*> current_gps_live_textures;
 static std::map<ID3D11ShaderResourceView*, live_screen_identity_t> live_srv_identities;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_bind_counts;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_draw_counts;
@@ -190,10 +191,36 @@ void HookedDraw(ID3D11DeviceContext* pContext, UINT VertexCount, UINT StartVerte
     Draw_Original(pContext, VertexCount, StartVertexLocation);
 }
 
+static bool ShouldSkipGpsDrawIndexed(ID3D11DeviceContext* pContext)
+{
+    static uint64_t skipped_gps_draw_count{};
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+
+    for (auto& [slot_key, state] : tracked_bound_slots) {
+        if (slot_key.first != pContext)
+            continue;
+
+        ID3D11Resource* resource = tracked_live_srvs[state.srv];
+        const auto* identity = FindResourceIdentity(resource);
+        if (!identity || strcmp(identity->screen_type, "GPS") != 0 ||
+            current_gps_live_textures.count(resource) == 0)
+            continue;
+
+        ++skipped_gps_draw_count;
+        if (skipped_gps_draw_count % 60 == 0)
+            scs_log(0, "[VISIBILITY_TEST] skipped GPS DrawIndexed srv=%p resource=%p slot=%u",
+                state.srv, resource, slot_key.second);
+        return true;
+    }
+    return false;
+}
+
 void HookedDrawIndexed(ID3D11DeviceContext* pContext, UINT IndexCount,
     UINT StartIndexLocation, INT BaseVertexLocation)
 {
     LogTrackedDraw(pContext, "DrawIndexed", IndexCount, StartIndexLocation, BaseVertexLocation);
+    if (ShouldSkipGpsDrawIndexed(pContext))
+        return;
     DrawIndexed_Original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -358,6 +385,10 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                     scs_log(0, "[DISPLAYDBG] liveTexture replaced screenType=%s originalTexture=%s overrideTexture=%s old->null epoch=%llu texture=%p",
                         ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                         screen.textureEpoch, screen.liveTexture);
+                    {
+                        std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+                        current_gps_live_textures.erase(static_cast<ID3D11Resource*>(screen.liveTexture));
+                    }
                     scs_log(0, "[FRAME] liveTexture changed old=%p new=null (releasing before replacement)",
                         static_cast<void*>(screen.liveTexture));
                     screen.liveTexture->Release();
@@ -374,6 +405,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                     ID3D11Resource* resource = static_cast<ID3D11Resource*>(screen.liveTexture);
                     live_texture_epochs[resource] = screen.textureEpoch;
                     live_screen_identities[resource] = ScreenIdentity(screen);
+                    if (screen.type == screen_type_t::GPS)
+                        current_gps_live_textures.insert(resource);
                 }
                 scs_log(0, "[DISPLAYDBG] liveTexture epoch assigned screenType=%s originalTexture=%s overrideTexture=%s epoch=%llu texture=%p",
                     ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
