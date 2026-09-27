@@ -80,7 +80,7 @@ namespace sources {
                     std::this_thread::sleep_for(frameInterval);
                     continue;
                 }
-                GetDIBits(memDC, bitmap, 0, height, bgraScratch.data(), &bmi, DIB_RGB_COLORS);
+                const int copiedLines = GetDIBits(memDC, bitmap, 0, height, bgraScratch.data(), &bmi, DIB_RGB_COLORS);
 
                 {
                     std::lock_guard<std::mutex> lock(m_bufferMutex);
@@ -101,9 +101,14 @@ namespace sources {
                     m_haveFrame = true;
                     const uint64_t generation = m_frameGeneration.fetch_add(1) + 1;
                     if (generation == 1 || generation == 2 || generation == 3 || generation == 10 ||
-                        generation == 100 || generation == 500)
+                        generation == 100 || generation == 500) {
                         scs_log(0, "[CAPTUREDBG] new source frame backend=Legacy generation=%llu width=%u height=%u",
                             generation, width, height);
+                        scs_log(0, "[LEGACYDBG] capture PrintWindow=TRUE GetDIBitsLines=%d ExpectedLines=%u",
+                            copiedLines, height);
+                    }
+                    if (copiedLines != static_cast<int>(height))
+                        scs_log(2, "[LEGACYDBG] GetDIBits incomplete");
                 }
 
                 m_width = width;

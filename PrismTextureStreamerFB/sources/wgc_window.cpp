@@ -126,6 +126,13 @@ namespace sources {
 
         void OnFrameArrived(Graphics::Capture::Direct3D11CaptureFramePool const& sender, Foundation::IInspectable const&)
         {
+            static std::atomic<uint64_t> callback_count{};
+            const uint64_t callback = callback_count.fetch_add(1) + 1;
+            const bool log_callback = callback == 1 || callback == 2 || callback == 3 || callback == 10 ||
+                callback == 100 || callback == 500;
+            if (log_callback)
+                scs_log(0, "[WGCDBG] FrameArrived entered callback=%llu", callback);
+
             std::lock_guard<std::mutex> lockFrame(m_frameMutex);
             if (m_stopping.load())
                 return;
@@ -133,6 +140,8 @@ namespace sources {
             try {
                 auto frame = sender.TryGetNextFrame();
                 if (!frame) return;
+                if (log_callback)
+                    scs_log(0, "[WGCDBG] TryGetNextFrame success callback=%llu", callback);
 
                 auto contentSize = frame.ContentSize();
 
@@ -155,14 +164,19 @@ namespace sources {
                 desc.MiscFlags = 0;
 
                 winrt::com_ptr<ID3D11Texture2D> staging;
-                m_d3dDevice->CreateTexture2D(&desc, nullptr, staging.put());
+                const HRESULT create_hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, staging.put());
+                if (log_callback)
+                    scs_log(0, "[WGCDBG] CreateTexture2D HRESULT=0x%08X callback=%llu", create_hr, callback);
 
                 winrt::com_ptr<ID3D11DeviceContext> ctx;
                 m_d3dDevice->GetImmediateContext(ctx.put());
                 ctx->CopyResource(staging.get(), gpuTexture.get());
 
                 D3D11_MAPPED_SUBRESOURCE mapped;
-                if (SUCCEEDED(ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+                const HRESULT map_hr = ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped);
+                if (log_callback)
+                    scs_log(0, "[WGCDBG] Map HRESULT=0x%08X callback=%llu", map_hr, callback);
+                if (SUCCEEDED(map_hr))
                 {
                     // mapped.pData is BGRA. RowPitch may not equal width*4, so walk rows manually.
                     // We also swap B/R here so the output is RGBA to match liveTexture's format.
@@ -194,9 +208,17 @@ namespace sources {
                         scs_log(0, "[CAPTUREDBG] new source frame backend=WGC generation=%llu width=%u height=%u",
                             generation, desc.Width, desc.Height);
                 }
+                if (log_callback)
+                    scs_log(0, "[WGCDBG] frame callback completed callback=%llu", callback);
             }
             catch (const winrt::hresult_error& e) {
                 scs_log(2, "[WgcWindowSource] OnFrameArrived failed: 0x%08X", e.code().value);
+            }
+            catch (const std::exception& e) {
+                scs_log(2, "[WgcWindowSource] OnFrameArrived failed: %s", e.what());
+            }
+            catch (...) {
+                scs_log(2, "[WgcWindowSource] OnFrameArrived failed: unknown exception");
             }
         }
 

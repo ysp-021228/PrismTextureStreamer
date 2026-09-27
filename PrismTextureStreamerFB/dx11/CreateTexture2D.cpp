@@ -317,7 +317,7 @@ void new_frame()
     static std::set<ID3D11Texture2D*> upload_started_logged;
     static std::set<ID3D11Texture2D*> upload_completed_logged;
     static std::map<ID3D11Texture2D*, uint64_t> last_uploaded_generation;
-    static std::map<ID3D11Texture2D*, uint64_t> last_frameupd_generation;
+    static std::map<ID3D11Texture2D*, std::vector<uint8_t>> previous_samples;
     std::lock_guard<std::mutex> lock(g_screens_mutex);
     for (auto& screen : g_screens)
     {
@@ -349,7 +349,6 @@ void new_frame()
         if (!screen.liveTexture || !screen.immediateContext)
             continue;
 
-        const uint64_t generation_before_copy = screen.source->GetFrameGeneration();
         const bool copy_succeeded = screen.source->CopyLatestFrame(screen.frameScratch);
         const uint64_t generation_after_copy = screen.source->GetFrameGeneration();
         const UINT srcWidth = screen.source->GetWidth();
@@ -366,22 +365,36 @@ void new_frame()
             continue;
 
         const uint64_t generation = generation_after_copy;
-        const auto previous_frameupd = last_frameupd_generation.find(screen.liveTexture);
-        const bool generation_changed = previous_frameupd == last_frameupd_generation.end() ||
-            previous_frameupd->second != generation;
-        if (generation != 0 && generation_changed) {
+        const bool should_sample = generation == 1 || (generation != 0 && generation % 30 == 0);
+        if (should_sample && srcWidth != 0 && srcHeight != 0) {
+            std::vector<uint8_t> samples;
+            samples.reserve(32 * 32 * 4);
             uint32_t sample_hash = 2166136261u;
-            for (size_t offset : { size_t(0), screen.frameScratch.size() / 2,
-                                   screen.frameScratch.size() > 4 ? screen.frameScratch.size() - 4 : size_t(0) }) {
-                if (offset + 4 <= screen.frameScratch.size()) {
-                    for (size_t i = 0; i < 4; ++i)
-                        sample_hash = (sample_hash ^ screen.frameScratch[offset + i]) * 16777619u;
+            for (UINT sample_y = 0; sample_y < 32; ++sample_y) {
+                const UINT y = (sample_y * (srcHeight - 1)) / 31;
+                for (UINT sample_x = 0; sample_x < 32; ++sample_x) {
+                    const UINT x = (sample_x * (srcWidth - 1)) / 31;
+                    const size_t offset = (static_cast<size_t>(y) * srcWidth + x) * 4;
+                    for (size_t channel = 0; channel < 4; ++channel) {
+                        const uint8_t value = screen.frameScratch[offset + channel];
+                        samples.push_back(value);
+                        sample_hash = (sample_hash ^ value) * 16777619u;
+                    }
                 }
             }
-            scs_log(0, "[FRAMEUPD] CopyLatestFrame generation=%llu changed=%s sampleHash=%u buffer=%p backend=%s",
-                generation, generation_changed ? "true" : "false", sample_hash,
-                screen.frameScratch.data(), screen.source->GetBackendName());
-            last_frameupd_generation[screen.liveTexture] = generation;
+            const auto previous = previous_samples.find(screen.liveTexture);
+            size_t changed_sample_count = samples.size() / 4;
+            if (previous != previous_samples.end()) {
+                changed_sample_count = 0;
+                for (size_t sample = 0; sample < samples.size(); sample += 4) {
+                    if (memcmp(samples.data() + sample, previous->second.data() + sample, 4) != 0)
+                        ++changed_sample_count;
+                }
+            }
+            scs_log(0, "[FRAMEUPD] sampled generation=%llu sampleHash=%u changedSampleCount=%zu width=%u height=%u backend=%s",
+                generation, sample_hash, changed_sample_count, srcWidth, srcHeight,
+                screen.source->GetBackendName());
+            previous_samples[screen.liveTexture] = std::move(samples);
         }
 
         const UINT dstWidth = screen.liveTextureWidth;
