@@ -238,7 +238,7 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
                 rtv->GetResource(&render_target_resource);
             scs_log(0, "[RTDBG] gpsTexture=%p gpsSrv=%p gpsSlot=%u drawType=%s rtv=%p renderTargetResource=%p pixelShader=%p",
                 resource, state.srv, slot, type, rtv, render_target_resource, current_pixel_shaders[pContext]);
-            if (render_target_resource)
+            if (render_target_resource && gps_render_target_resources.empty())
                 gps_render_target_resources.insert(render_target_resource);
             if (render_target_resource)
                 render_target_resource->Release();
@@ -266,9 +266,31 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
     }
 }
 
+static bool ShouldSkipDownstreamDraw(ID3D11DeviceContext* pContext, const char* draw_type)
+{
+    static std::map<ID3D11ShaderResourceView*, uint64_t> skipped_draw_counts;
+    std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+    for (auto& [slot_key, state] : tracked_bound_slots) {
+        if (slot_key.first != pContext)
+            continue;
+        ID3D11Resource* resource = tracked_live_srvs[state.srv];
+        if (gps_render_target_resources.count(resource) == 0)
+            continue;
+
+        const uint64_t count = ++skipped_draw_counts[state.srv];
+        if (count == 1 || count % 60 == 0)
+            scs_log(0, "[DOWNSTREAM_VIS] resource=%p srv=%p slot=%u drawType=%s skipped=true",
+                resource, state.srv, slot_key.second, draw_type);
+        return true;
+    }
+    return false;
+}
+
 void HookedDraw(ID3D11DeviceContext* pContext, UINT VertexCount, UINT StartVertexLocation)
 {
     LogTrackedDraw(pContext, "Draw", VertexCount, StartVertexLocation, 0);
+    if (ShouldSkipDownstreamDraw(pContext, "Draw"))
+        return;
     Draw_Original(pContext, VertexCount, StartVertexLocation);
 }
 
@@ -276,6 +298,8 @@ void HookedDrawIndexed(ID3D11DeviceContext* pContext, UINT IndexCount,
     UINT StartIndexLocation, INT BaseVertexLocation)
 {
     LogTrackedDraw(pContext, "DrawIndexed", IndexCount, StartIndexLocation, BaseVertexLocation);
+    if (ShouldSkipDownstreamDraw(pContext, "DrawIndexed"))
+        return;
     DrawIndexed_Original(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
