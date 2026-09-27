@@ -225,10 +225,11 @@ static void RunPredrawGpsTest(ID3D11DeviceContext* pContext)
         D3D11_MAPPED_SUBRESOURCE mapped{};
         const HRESULT map_hr = pContext->Map(
             static_cast<ID3D11Texture2D*>(resource), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        scs_log(0, "[PREDRAW_TEST] draw=%llu texture=%p srv=%p MapHRESULT=0x%08X RowPitch=%u testColor=%s",
-            gps_draw_count, resource, state.srv, map_hr, mapped.RowPitch, red ? "RED" : "GREEN");
-        if (FAILED(map_hr))
+        if (FAILED(map_hr)) {
+            scs_log(0, "[PREDRAW_REBIND] draw=%llu texture=%p srv=%p slot=%u MapHRESULT=0x%08X rebind=false testColor=%s",
+                gps_draw_count, resource, state.srv, slot_key.second, map_hr, red ? "RED" : "GREEN");
             continue;
+        }
 
         for (UINT y = 0; y < height; ++y) {
             uint8_t* row = static_cast<uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
@@ -240,6 +241,10 @@ static void RunPredrawGpsTest(ID3D11DeviceContext* pContext)
             }
         }
         pContext->Unmap(static_cast<ID3D11Texture2D*>(resource), 0);
+        ID3D11ShaderResourceView* gps_srv = state.srv;
+        PSSetShaderResources_Original(pContext, slot_key.second, 1, &gps_srv);
+        scs_log(0, "[PREDRAW_REBIND] draw=%llu texture=%p srv=%p slot=%u MapHRESULT=0x%08X rebind=true testColor=%s",
+            gps_draw_count, resource, state.srv, slot_key.second, map_hr, red ? "RED" : "GREEN");
     }
 }
 
