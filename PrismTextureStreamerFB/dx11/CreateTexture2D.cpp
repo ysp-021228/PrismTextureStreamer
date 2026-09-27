@@ -20,6 +20,13 @@ static CreateTexture2D_t CreateTexture2D_Original = nullptr;
 typedef HRESULT(__stdcall* CreateShaderResourceView_t)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, ID3D11ShaderResourceView**);
 static CreateShaderResourceView_t CreateShaderResourceView_Original = nullptr;
 
+typedef void(__stdcall* CopyResource_t)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+static CopyResource_t CopyResource_Original = nullptr;
+typedef void(__stdcall* CopySubresourceRegion_t)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*);
+static CopySubresourceRegion_t CopySubresourceRegion_Original = nullptr;
+typedef void(__stdcall* ResolveSubresource_t)(ID3D11DeviceContext*, ID3D11Resource*, UINT, ID3D11Resource*, UINT, DXGI_FORMAT);
+static ResolveSubresource_t ResolveSubresource_Original = nullptr;
+
 static std::mutex historical_live_textures_mutex;
 static std::set<ID3D11Resource*> historical_live_textures;
 static std::mutex tracked_live_srvs_mutex;
@@ -33,6 +40,9 @@ struct live_screen_identity_t {
     std::string override_texture;
 };
 static std::map<ID3D11Resource*, live_screen_identity_t> live_screen_identities;
+static std::set<ID3D11Resource*> current_gps_live_textures;
+static std::set<ID3D11Resource*> gps_downstream_resources;
+static std::atomic<uint64_t> latest_gps_capture_generation{};
 static std::map<ID3D11ShaderResourceView*, live_screen_identity_t> live_srv_identities;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_bind_counts;
 static std::map<ID3D11ShaderResourceView*, uint64_t> display_draw_counts;
@@ -71,10 +81,56 @@ static const live_screen_identity_t* FindResourceIdentity(ID3D11Resource* resour
     auto it = live_screen_identities.find(resource);
     return it == live_screen_identities.end() ? nullptr : &it->second;
 }
+
+static bool IsGpsResource(ID3D11Resource* resource)
+{
+    return current_gps_live_textures.count(resource) != 0;
+}
+
+static void LogCopyFlow(const char* api, ID3D11Resource* src, ID3D11Resource* dst,
+    bool gps_is_src, bool gps_is_dst)
+{
+    if (!gps_is_src && !gps_is_dst)
+        return;
+    scs_log(0, "[COPYDBG] api=%s src=%p dst=%p gpsIsSrc=%s gpsIsDst=%s captureGeneration=%llu",
+        api, src, dst, gps_is_src ? "true" : "false", gps_is_dst ? "true" : "false",
+        latest_gps_capture_generation.load());
+    if (gps_is_src && !gps_is_dst)
+        gps_downstream_resources.insert(dst);
+}
+
 typedef void(__stdcall* Draw_t)(ID3D11DeviceContext*, UINT, UINT);
 static Draw_t Draw_Original = nullptr;
 typedef void(__stdcall* DrawIndexed_t)(ID3D11DeviceContext*, UINT, UINT, INT);
 static DrawIndexed_t DrawIndexed_Original = nullptr;
+
+void HookedCopyResource(ID3D11DeviceContext* pContext, ID3D11Resource* pDstResource, ID3D11Resource* pSrcResource)
+{
+    const bool gps_is_src = IsGpsResource(pSrcResource);
+    const bool gps_is_dst = IsGpsResource(pDstResource);
+    LogCopyFlow("CopyResource", pSrcResource, pDstResource, gps_is_src, gps_is_dst);
+    CopyResource_Original(pContext, pDstResource, pSrcResource);
+}
+
+void HookedCopySubresourceRegion(ID3D11DeviceContext* pContext, ID3D11Resource* pDstResource,
+    UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource* pSrcResource,
+    UINT SrcSubresource, const D3D11_BOX* pSrcBox)
+{
+    const bool gps_is_src = IsGpsResource(pSrcResource);
+    const bool gps_is_dst = IsGpsResource(pDstResource);
+    LogCopyFlow("CopySubresourceRegion", pSrcResource, pDstResource, gps_is_src, gps_is_dst);
+    CopySubresourceRegion_Original(pContext, pDstResource, DstSubresource, DstX, DstY, DstZ,
+        pSrcResource, SrcSubresource, pSrcBox);
+}
+
+void HookedResolveSubresource(ID3D11DeviceContext* pContext, ID3D11Resource* pDstResource,
+    UINT DstSubresource, ID3D11Resource* pSrcResource, UINT SrcSubresource, DXGI_FORMAT Format)
+{
+    const bool gps_is_src = IsGpsResource(pSrcResource);
+    const bool gps_is_dst = IsGpsResource(pDstResource);
+    LogCopyFlow("ResolveSubresource", pSrcResource, pDstResource, gps_is_src, gps_is_dst);
+    ResolveSubresource_Original(pContext, pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format);
+}
 
 void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, UINT NumViews,
     ID3D11ShaderResourceView* const* ppShaderResourceViews)
@@ -131,6 +187,8 @@ void HookedPSSetShaderResources(ID3D11DeviceContext* pContext, UINT StartSlot, U
                     identity ? identity->original_texture.c_str() : "",
                     identity ? identity->override_texture.c_str() : "",
                     epoch, resource, new_srv, slot);
+                if (gps_downstream_resources.count(resource) != 0)
+                    scs_log(0, "[COPYDBG] downstream bind resource=%p srv=%p slot=%u", resource, new_srv, slot);
             }
         }
         else if (old_was_tracked) {
@@ -171,6 +229,8 @@ void LogTrackedDraw(ID3D11DeviceContext* pContext, const char* type, UINT count,
                 identity ? identity->original_texture.c_str() : "",
                 identity ? identity->override_texture.c_str() : "",
                 epoch, resource, state.srv, slot, current_pixel_shaders[pContext]);
+            if (gps_downstream_resources.count(resource) != 0)
+                scs_log(0, "[COPYDBG] downstream draw resource=%p srv=%p slot=%u", resource, state.srv, slot);
         }
         if (!state.draw_seen) {
             state.draw_seen = true;
@@ -206,11 +266,13 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
         matches_live_texture = historical_live_textures.count(pResource) != 0;
     }
 
-    if (!matches_live_texture)
+    const bool matches_gps_downstream = gps_downstream_resources.count(pResource) != 0;
+    if (!matches_live_texture && !matches_gps_downstream)
         return CreateShaderResourceView_Original(pDevice, pResource, pDesc, ppSRView);
 
     const auto* resource_identity = FindResourceIdentity(pResource);
-    scs_log(0, "[SRV] resource matches liveTexture screenType=%s originalTexture=%s overrideTexture=%s pResource=%p liveTexture=%p pDesc=%p",
+    scs_log(0, "[SRV] resource matches %s screenType=%s originalTexture=%s overrideTexture=%s pResource=%p liveTexture=%p pDesc=%p",
+        matches_gps_downstream ? "GPS downstream" : "liveTexture",
         resource_identity ? resource_identity->screen_type : "UNKNOWN",
         resource_identity ? resource_identity->original_texture.c_str() : "",
         resource_identity ? resource_identity->override_texture.c_str() : "",
@@ -255,6 +317,8 @@ HRESULT HookedCreateShaderResourceView(ID3D11Device* pDevice, ID3D11Resource* pR
         std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
         tracked_live_srvs[*ppSRView] = pResource;
         const uint64_t epoch = live_texture_epochs.count(pResource) ? live_texture_epochs[pResource] : 0;
+        if (matches_gps_downstream)
+            scs_log(0, "[COPYDBG] downstream SRV created resource=%p srv=%p", pResource, *ppSRView);
         live_srv_epochs[*ppSRView] = epoch;
         live_resource_srvs[pResource] = *ppSRView;
         auto resource_identity = live_screen_identities.find(pResource);
@@ -358,6 +422,10 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                     scs_log(0, "[DISPLAYDBG] liveTexture replaced screenType=%s originalTexture=%s overrideTexture=%s old->null epoch=%llu texture=%p",
                         ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
                         screen.textureEpoch, screen.liveTexture);
+                    {
+                        std::lock_guard<std::mutex> lock(tracked_live_srvs_mutex);
+                        current_gps_live_textures.erase(static_cast<ID3D11Resource*>(screen.liveTexture));
+                    }
                     scs_log(0, "[FRAME] liveTexture changed old=%p new=null (releasing before replacement)",
                         static_cast<void*>(screen.liveTexture));
                     screen.liveTexture->Release();
@@ -374,6 +442,8 @@ HRESULT HookedCreateTexture2D(ID3D11Device* pDevice, const D3D11_TEXTURE2D_DESC*
                     ID3D11Resource* resource = static_cast<ID3D11Resource*>(screen.liveTexture);
                     live_texture_epochs[resource] = screen.textureEpoch;
                     live_screen_identities[resource] = ScreenIdentity(screen);
+                    if (screen.type == screen_type_t::GPS)
+                        current_gps_live_textures.insert(resource);
                 }
                 scs_log(0, "[DISPLAYDBG] liveTexture epoch assigned screenType=%s originalTexture=%s overrideTexture=%s epoch=%llu texture=%p",
                     ScreenTypeName(screen.type), screen.original_texture.c_str(), screen.override_texture.c_str(),
@@ -545,6 +615,8 @@ void new_frame()
                     generation, screen.textureEpoch, screen.liveTexture, srv);
             }
             last_uploaded_generation[screen.liveTexture] = generation;
+            if (screen.type == screen_type_t::GPS)
+                latest_gps_capture_generation.store(generation);
         }
         if (upload_completed_logged.insert(screen.liveTexture).second)
             scs_log(0, "[FRAME] frame upload completed");
@@ -587,6 +659,30 @@ namespace dx11::create_texture_2d {
         }
 
         void** contextVtbl = *reinterpret_cast<void***>(pDummyContext);
+        void* copySubresourceRegionAddr = contextVtbl[46];
+        MH_STATUS copy_subresource_create_status = MH_CreateHook(copySubresourceRegionAddr, &HookedCopySubresourceRegion,
+            reinterpret_cast<LPVOID*>(&CopySubresourceRegion_Original));
+        scs_log(0, "[COPYDBG] CopySubresourceRegion hook status=%s original=%p",
+            MH_StatusToString(copy_subresource_create_status), reinterpret_cast<void*>(CopySubresourceRegion_Original));
+        if (copy_subresource_create_status == MH_OK)
+            MH_EnableHook(copySubresourceRegionAddr);
+
+        void* copyResourceAddr = contextVtbl[47];
+        MH_STATUS copy_resource_create_status = MH_CreateHook(copyResourceAddr, &HookedCopyResource,
+            reinterpret_cast<LPVOID*>(&CopyResource_Original));
+        scs_log(0, "[COPYDBG] CopyResource hook status=%s original=%p",
+            MH_StatusToString(copy_resource_create_status), reinterpret_cast<void*>(CopyResource_Original));
+        if (copy_resource_create_status == MH_OK)
+            MH_EnableHook(copyResourceAddr);
+
+        void* resolveSubresourceAddr = contextVtbl[49];
+        MH_STATUS resolve_subresource_create_status = MH_CreateHook(resolveSubresourceAddr, &HookedResolveSubresource,
+            reinterpret_cast<LPVOID*>(&ResolveSubresource_Original));
+        scs_log(0, "[COPYDBG] ResolveSubresource hook status=%s original=%p",
+            MH_StatusToString(resolve_subresource_create_status), reinterpret_cast<void*>(ResolveSubresource_Original));
+        if (resolve_subresource_create_status == MH_OK)
+            MH_EnableHook(resolveSubresourceAddr);
+
         void* psSetShaderResourcesAddr = contextVtbl[8];
         MH_STATUS ps_create_status = MH_CreateHook(psSetShaderResourcesAddr, &HookedPSSetShaderResources,
             reinterpret_cast<LPVOID*>(&PSSetShaderResources_Original));
