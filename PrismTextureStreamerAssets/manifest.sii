@@ -1,0 +1,10 @@
+SiiNunit
+{
+mod_package : .package {
+    package_version: "0.1.0"
+    display_name: "PrismTextureStreamer GPS override"
+    author: "PrismTextureStreamer"
+    category: "graphics"
+    description: "Development GPS texture override resource"
+}
+}
