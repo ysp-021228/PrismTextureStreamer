@@ -1,12 +1,9 @@
 from pathlib import Path
 import struct
 
-WIDTH = 64
-HEIGHT = 2048
 MIP_LEVELS = 12
 ROOT = Path(__file__).resolve().parents[1]
-DDS_PATH = ROOT / "home" / "PrismTextureStreamer" / "gps.dds"
-TOBJ_PATH = ROOT / "home" / "PrismTextureStreamer" / "gps.tobj"
+ASSET_ROOT = ROOT / "home" / "PrismTextureStreamer"
 
 
 def rgb565(r, g, b):
@@ -20,9 +17,8 @@ def bc3_block(r, g, b, a=255):
     return alpha + color
 
 
-def dds_payload():
+def dds_payload(width, height):
     payload = bytearray()
-    width, height = WIDTH, HEIGHT
     while True:
         blocks_x = max(1, (width + 3) // 4)
         blocks_y = max(1, (height + 3) // 4)
@@ -38,23 +34,24 @@ def dds_payload():
     return payload
 
 
-def write_dds():
+def write_dds(name, width, height):
     # DDS_HEADER + DX10 is avoided: FourCC DXT5 is BC3_UNORM, broadly supported by Prism3D.
     flags = 0x00021007  # CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE | MIPMAPCOUNT
     caps = 0x00400808   # COMPLEX | TEXTURE | MIPMAP
     pixel_format = struct.pack("<II4s5I", 32, 0x00000004, b"DXT5", 0, 0, 0, 0, 0)
     header = struct.pack(
         "<7I11I",
-        124, flags, HEIGHT, WIDTH,
-        max(16, ((WIDTH + 3) // 4) * ((HEIGHT + 3) // 4) * 16),
+        124, flags, height, width,
+        max(16, ((width + 3) // 4) * ((height + 3) // 4) * 16),
         0, MIP_LEVELS, *([0] * 11)
     ) + pixel_format + struct.pack("<5I", caps, 0, 0, 0, 0)
     assert len(header) == 124
-    DDS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DDS_PATH.write_bytes(b"DDS " + header + dds_payload())
+    path = ASSET_ROOT / f"{name}.dds"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"DDS " + header + dds_payload(width, height))
 
 
-def write_tobj():
+def write_tobj(name):
     # SCS TOBJ default-texture header, matching the public TOBJEditor format.
     header = bytes.fromhex(
         "01 0A B1 70 00 00 00 00 00 00 00 00 "
@@ -62,12 +59,14 @@ def write_tobj():
         "02 00 03 03 03 00 00 00 00 01 00 00 "
         "00 01 00 00 35 00 00 00 00 00 00 00"
     )
-    path = b"/home/PrismTextureStreamer/gps.dds"
-    TOBJ_PATH.write_bytes(header[:40] + bytes((len(path),)) + header[41:48] + path)
+    path = f"/home/PrismTextureStreamer/{name}.dds".encode()
+    tobj_path = ASSET_ROOT / f"{name}.tobj"
+    tobj_path.write_bytes(header[:40] + bytes((len(path),)) + header[41:48] + path)
 
 
 if __name__ == "__main__":
-    write_dds()
-    write_tobj()
-    print(f"generated {DDS_PATH}")
-    print(f"generated {TOBJ_PATH}")
+    for name, width, height in (("gps", 64, 2048), ("dashboard", 2048, 64)):
+        write_dds(name, width, height)
+        write_tobj(name)
+        print(f"generated {ASSET_ROOT / name}.dds")
+        print(f"generated {ASSET_ROOT / name}.tobj")

@@ -2,9 +2,9 @@ SiiNunit
 {
 mod_package : .package {
     package_version: "0.1.0"
-    display_name: "PrismTextureStreamer GPS override"
+    display_name: "PrismTextureStreamer GPS and Dashboard overrides"
     author: "PrismTextureStreamer"
     category: "graphics"
-    description: "Development GPS texture override resource"
+    description: "Development GPS and Dashboard texture override resources"
 }
 }
